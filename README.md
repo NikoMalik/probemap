@@ -88,7 +88,57 @@ let map = SwissTable::<PairExtract<String, u64>, RandomState>::with_hasher(Rando
 | iter | **1.21 µs** | 1.25 µs | 1.25 µs | **-3%** |
 | clone | **1.19 µs** | 1.25 µs | 1.29 µs | **-5%** |
 
-probemap is faster than hashbrown across all benchmarks.
+
+
+## Why faster than hashbrown?
+
+Both probemap and hashbrown implement the same SwissTable algorithm and use the
+same SSE2 intrinsics. The performance difference comes from how the surrounding
+code is structured.
+
+**Monomorphized key comparison vs `dyn FnMut`.**
+hashbrown's inner lookup (`find_inner`) takes the key comparator as
+`&mut dyn FnMut(usize) -> bool` — a trait object. This means every key
+comparison in the probe loop is an indirect call through a vtable pointer.
+The CPU cannot predict it, and LLVM cannot inline through it. This is a
+deliberate trade-off in hashbrown to reduce binary size from monomorphization.
+probemap calls `E::extract(slot) == key` directly — the compiler monomorphizes
+the comparison for each concrete type and inlines it into the probe loop,
+eliminating the indirect call overhead entirely. This is likely the single
+biggest contributor to the ~30% lookup speedup.
+
+**Forward slot layout.**
+hashbrown stores slots in reverse order relative to control bytes
+(`base.sub(index)`). probemap uses forward order (`slots.add(index)`). Modern
+CPUs prefetch forward; reverse indexing works against the hardware prefetcher.
+
+**Flatter data path.**
+hashbrown has four layers: `HashMap` -> `HashTable` -> `RawTable` ->
+`RawTableInner`. `RawTableInner` type-erases the value to `*u8` and reconstructs
+`Bucket<T>` through pointer arithmetic. probemap is a single struct with inline
+methods — no type erasure, no `Bucket` wrapper, no intermediate layers.
+
+**Linear group probing.**
+hashbrown uses triangular probing (`stride += 16; pos += stride`) — two
+additions and an extra field per step. probemap uses linear probing with
+mirrored control bytes: `pos = (pos + 16) & mask` — one add, one and. The
+mirror (first 16 control bytes duplicated at the end of the array) lets
+unaligned SIMD loads wrap around without sentinel bytes or branches.
+
+**`insert_assume_unique` during grow.**
+When rehashing into a fresh table, there can be no duplicates. probemap skips
+the h2 match + key comparison loop and only scans for empty slots. hashbrown
+also optimizes this path but carries extra bookkeeping (`growth_left` updates)
+in the hot loop.
+
+**SIMD iterator with `match_full()`.**
+The iterator loads 16 control bytes, extracts a bitmask of occupied slots with
+`_mm_movemask_epi8`, and pops bits with `trailing_zeros`. Empty groups are
+skipped in one branch. The struct is flat — `(table, group_pos, bitmask)`.
+
+**Bulk `memcpy` clone.**
+`clone_table()` checks `needs_drop::<V>()` at compile time. For `Copy` types
+the entire slots array is a single `memcpy` — no per-element loop, no rehash.
 
 ## Requirements
 
