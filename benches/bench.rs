@@ -15,7 +15,7 @@ use hashbrown::HashMap as HbMap;
 
 use probemap::{FxBuildHasher, KeyExtract, PairExtract, SwissTable};
 
-const SIZE: usize = 1000;
+const SIZE: usize = 10000;
 
 type HbFxMap<K, V> = HbMap<K, V, FxBuildHasher>;
 type HbFoldMap<K, V> = HbMap<K, V>;

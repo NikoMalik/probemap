@@ -1,6 +1,6 @@
 [package]
 name = "probemap"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A flat hash map based on Google's SwissTable design (used in Abseil C++)"                                                                                
 license = "Apache-2.0"                                                                                                                                                  
@@ -47,7 +47,6 @@ str_to_string = "warn"
 allocator-api2 = { version = "0.2.9", optional = true, default-features = false, features = [
   "alloc",
 ] }
-buthash = "0.1.0"
 
 
 [features]
@@ -64,6 +63,12 @@ libc = "0.2.155"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 hashbrown = "0.15"
+
+[profile.bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 
 [[bench]]
 name = "bench"
