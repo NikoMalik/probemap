@@ -786,7 +786,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
             let group = unsafe { Group::load(self.ctrl_ptr().add(pos)) };
             let empty = group.match_empty();
-            if empty.any() {
+            if likely(empty.any()) {
                 let idx = (pos + empty.lowest_set_bit()) & mask;
                 // SAFETY: idx < cap (masked), slot is valid uninitialized memory from alloc_slots.
                 unsafe {
@@ -835,7 +835,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             }
 
             // Track first empty/deleted slot in probe order
-            if unlikely(first_empty == usize::MAX) {
+            if likely(first_empty == usize::MAX) {
                 let empty_del = group.match_empty_or_deleted();
                 if empty_del.any() {
                     first_empty = (pos + empty_del.lowest_set_bit()) & cap_mask;

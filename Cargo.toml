@@ -1,6 +1,6 @@
 [package]
 name = "probemap"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A flat hash map based on Google's SwissTable design (used in Abseil C++)"                                                                                
 license = "Apache-2.0"                                                                                                                                                  
@@ -28,6 +28,7 @@ missing_safety_doc = "allow"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 option_if_let_else = "allow"
+undocumented_unsafe_blocks = "warn"
 
 borrow_as_ptr = "warn"
 manual_let_else = "warn"
