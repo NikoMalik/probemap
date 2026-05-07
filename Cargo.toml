@@ -1,0 +1,69 @@
+[package]
+name = "probemap"
+version = "0.1.0"
+edition = "2024"
+description = "A flat hash map based on Google's SwissTable design (used in Abseil C++)"                                                                                
+license = "Apache-2.0"                                                                                                                                                  
+repository = "https://github.com/NikoMalik/probemap"
+
+
+
+
+[lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+bare_trait_objects = "warn"
+elided_lifetimes_in_paths = "warn"
+ellipsis_inclusive_range_patterns = "warn"
+explicit_outlives_requirements = "warn"
+unused_extern_crates = "warn"
+
+
+[lints.clippy]
+doc_markdown = "allow"
+manual_map = "allow"
+missing_errors_doc = "allow"
+missing_safety_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+option_if_let_else = "allow"
+
+borrow_as_ptr = "warn"
+manual_let_else = "warn"
+needless_continue = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+redundant_else = "warn"
+ref_as_ptr = "warn"
+semicolon_if_nothing_returned = "warn"
+str_to_string = "warn"
+
+
+
+
+[dependencies]
+allocator-api2 = { version = "0.2.9", optional = true, default-features = false, features = [
+  "alloc",
+] }
+buthash = "0.1.0"
+
+
+[features]
+default = [
+  "allocator-api2",
+]
+
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.155"
+
+
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+hashbrown = "0.15"
+
+[[bench]]
+name = "bench"
+harness = false
