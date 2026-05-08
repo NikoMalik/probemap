@@ -20,11 +20,38 @@ use core::arch::x86_64::*;
 use core::ptr::NonNull;
 
 use std::alloc::Layout;
-use std::borrow::Borrow;
 use std::hash::BuildHasher;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr;
+
+/// Key equivalence trait.
+///
+/// This trait defines the function used to compare the input value with the
+/// map keys (or set values) during a lookup operation such as [`HashMap::get`]
+/// or [`HashSet::contains`].
+/// It is provided with a blanket implementation based on the
+/// [`Borrow`](core::borrow::Borrow) trait.
+///
+/// # Correctness
+///
+/// Equivalent values must hash to the same value.
+pub trait Equivalent<K: ?Sized> {
+    /// Checks if this value is equivalent to the given key.
+    ///
+    /// Returns `true` if both values are equivalent, and `false` otherwise.
+    fn equivalent(&self, key: &K) -> bool;
+}
+
+impl<Q: ?Sized, K: ?Sized> Equivalent<K> for Q
+where
+    Q: Eq,
+    K: core::borrow::Borrow<Q>,
+{
+    fn equivalent(&self, key: &K) -> bool {
+        self == key.borrow()
+    }
+}
 
 /// `#[cold]` marks the function as rarely called, making the opposite branch
 /// the predicted path. Used to emulate `likely`/`unlikely` on stable.
@@ -558,6 +585,26 @@ unsafe fn set_ctrl(ctrl: *mut u8, mask: usize, idx: usize, value: u8) {
     }
 }
 
+impl<E, S, A> PartialEq for SwissTable<E, S, A>
+where
+    E: KeyExtract,
+    E::Key: PartialEq + Eq + std::hash::Hash,
+    E::Value: PartialEq,
+    S: BuildHasher,
+    A: Allocator,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+
+        self.iter().all(|v| {
+            let k = E::extract(v);
+            other.get(k).is_some_and(|ov| ov == v)
+        })
+    }
+}
+
 impl<E: KeyExtract, S: BuildHasher + Clone, A: Allocator + Clone> Clone for SwissTable<E, S, A>
 where
     E::Value: Clone,
@@ -692,7 +739,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     }
 
     /// Hash a key through the stored BuildHasher.
-    #[inline]
+    #[inline(always)]
     fn make_hash(&self, key: &E::Key) -> u64 {
         self.hash_builder.hash_one(key)
     }
@@ -945,8 +992,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     #[inline]
     fn get_inner<Q>(&self, key: &Q) -> Option<*const E::Value>
     where
-        E::Key: std::borrow::Borrow<Q>,
-        Q: std::hash::Hash + PartialEq + ?Sized,
+        Q: std::hash::Hash + Equivalent<E::Key> + ?Sized,
     {
         if unlikely(self.mask == 0) {
             return None;
@@ -968,7 +1014,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 let val_ptr = self.slot_mut(idx).cast::<E::Value>();
                 // SAFETY: val_ptr points to initialized Value (FULL slot).
                 let slot_ref = unsafe { &*val_ptr };
-                if E::extract(slot_ref).borrow() == key {
+                if key.equivalent(E::extract(slot_ref)) {
                     return Some(val_ptr);
                 }
                 mask.remove_lowest_bit();
@@ -984,8 +1030,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<&E::Value>
     where
-        E::Key: std::borrow::Borrow<Q>,
-        Q: std::hash::Hash + PartialEq + ?Sized,
+        Q: std::hash::Hash + Equivalent<E::Key> + ?Sized,
     {
         // SAFETY: get_inner returns pointer to initialized Value in a FULL slot; lifetime tied to &self.
 
@@ -996,19 +1041,21 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     #[inline]
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut E::Value>
     where
-        E::Key: std::borrow::Borrow<Q>,
-        Q: std::hash::Hash + PartialEq + ?Sized,
+        Q: std::hash::Hash + Equivalent<E::Key> + ?Sized,
     {
         // SAFETY: get_inner returns pointer to initialized Value in a FULL slot; &mut self ensures exclusive access.
         unsafe { self.get_inner(key).map(|p| &mut *p.cast_mut()) }
     }
 
     /// Remove by key. Uses DELETED tombstone to preserve probe chains.
-    fn remove_inner(&mut self, key: &E::Key) -> bool {
+    fn remove_inner<Q>(&mut self, key: &Q) -> bool
+    where
+        Q: std::hash::Hash + Equivalent<E::Key> + ?Sized,
+    {
         if unlikely(self.mask == 0) {
             return false;
         }
-        let hash = self.make_hash(key);
+        let hash = self.hash_builder.hash_one(key);
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
@@ -1025,7 +1072,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 let val_ptr = self.slot_mut(idx).cast::<E::Value>();
                 // SAFETY: val_ptr points to initialized Value (FULL slot).
                 let slot_ref = unsafe { &*val_ptr };
-                if E::extract(slot_ref) == key {
+                if key.equivalent(E::extract(slot_ref)) {
                     // SAFETY: dropping initialized value in FULL slot, marking as DELETED.
                     unsafe {
                         if core::mem::needs_drop::<E::Value>() {
@@ -1047,13 +1094,19 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
     /// Remove an element by key. Returns `true` if the key was found.
     #[inline]
-    pub fn remove(&mut self, key: &E::Key) -> bool {
+    pub fn remove<Q>(&mut self, key: &Q) -> bool
+    where
+        Q: std::hash::Hash + Equivalent<E::Key> + ?Sized,
+    {
         self.remove_inner(key)
     }
 
     /// Returns true if the key exists.
     #[inline]
-    pub fn contains(&self, key: &E::Key) -> bool {
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        Q: std::hash::Hash + Equivalent<E::Key> + ?Sized,
+    {
         self.get(key).is_some()
     }
 
@@ -1744,5 +1797,32 @@ mod tests {
         let value = names.get(arg.as_str());
 
         assert_eq!(value.map(|v| v.1), Some(1));
+    }
+
+    #[test]
+    #[doc = "Regression test for Table::retrieve"]
+    fn test_table_trait_retrieve() {
+        use super::*;
+
+        trait Table<V> {
+            fn retrieve(&self, key: &str) -> Option<&V>;
+        }
+
+        impl<V> Table<V> for SwissTable<PairExtract<&str, V>> {
+            fn retrieve(&self, key: &str) -> Option<&V> {
+                self.get(key).map(|(_, v)| v)
+            }
+        }
+
+        let mut names = SwissTable::<PairExtract<&str, u8>>::new();
+        names.insert(("one", 1));
+        names.insert(("two", 2));
+
+        // owned -> borrowed coercion
+        let arg = String::from("one");
+
+        let result = names.retrieve(&arg);
+
+        assert_eq!(result, Some(&1));
     }
 }

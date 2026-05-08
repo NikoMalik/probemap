@@ -1,6 +1,6 @@
 [package]
 name = "probemap"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "A flat hash map based on Google's SwissTable design (used in Abseil C++)"                                                                                
 license = "Apache-2.0"                                                                                                                                                  
@@ -47,6 +47,7 @@ str_to_string = "warn"
 allocator-api2 = { version = "0.2.9", optional = true, default-features = false, features = [
   "alloc",
 ] }
+
 
 
 [features]
