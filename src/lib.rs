@@ -289,7 +289,7 @@ pub trait KeyExtract {
 }
 
 /// Standard `(K, V)` extraction — key is the first element.
-pub struct PairExtract<K, V>(PhantomData<(K, V)>);
+pub struct PairExtract<K, V>(PhantomData<fn() -> (K, V)>);
 
 impl<K: std::hash::Hash + PartialEq, V> KeyExtract for PairExtract<K, V> {
     type Key = K;
@@ -532,7 +532,7 @@ pub struct SwissTable<E: KeyExtract, S: BuildHasher = DefaultHashBuilder, A: All
     pub(crate) growth_left: usize,
     pub(crate) hash_builder: S,
     pub(crate) alloc: A,
-    pub(crate) _marker: PhantomData<E::Value>,
+    pub(crate) _marker: PhantomData<fn() -> E::Value>,
 }
 
 /// Write a control byte and maintain the trailing mirror.
@@ -1648,5 +1648,40 @@ mod tests {
             map.insert((i, format!("value_{i}")));
         }
         drop(map);
+    }
+
+    #[test]
+    fn test_covariance() {
+        fn build<'a>() -> SwissTable<PairExtract<&'a str, u8>> {
+            let mut map = SwissTable::<PairExtract<&'a str, u8>>::new();
+
+            map.insert(("one", 1));
+            map.insert(("two", 2));
+
+            map
+        }
+
+        let map = build();
+
+        let key: &str = "one";
+        let value = map.get(&key);
+
+        assert_eq!(value.map(|v| v.1), Some(1));
+    }
+
+    #[test]
+    fn test_covariance_usage() {
+        fn takes<'a>(map: &SwissTable<PairExtract<&'a str, u8>>) {
+            let key: &'a str = "one";
+            let _ = map.get(&key);
+        }
+
+        let map = {
+            let mut m = SwissTable::<PairExtract<&'static str, u8>>::new();
+            m.insert(("one", 1));
+            m
+        };
+
+        takes(&map);
     }
 }
