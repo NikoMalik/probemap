@@ -61,7 +61,7 @@ fn serial_keys(n: usize) -> Vec<usize> {
 
 fn bench_insert(c: &mut Criterion) {
     let keys = random_keys(SIZE);
-    let mut g = c.benchmark_group("insert");
+    let mut g = c.benchmark_group("lookup");
 
     g.bench_function("probemap", |b| {
         let mut m = ProbeMap::with_capacity(SIZE);
@@ -620,20 +620,28 @@ fn bench_grow_insert_bytes(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_insert,
-    bench_insert_serial,
-    bench_grow_insert,
-    bench_lookup,
-    bench_lookup_serial,
-    bench_lookup_fail,
-    bench_insert_erase,
-    bench_iter,
-    bench_clone,
-    bench_insert_bytes,
-    bench_lookup_bytes,
-    bench_lookup_bytes_fail,
-    bench_grow_insert_bytes,
-);
+fn bench_config() -> Criterion {
+    Criterion::default()
+        .warm_up_time(std::time::Duration::from_secs(5))
+        .measurement_time(std::time::Duration::from_secs(10))
+}
+
+criterion_group! {
+    name = benches;
+    config = bench_config();
+    targets =
+        bench_insert,
+        bench_insert_serial,
+        bench_grow_insert,
+        bench_lookup,
+        bench_lookup_serial,
+        bench_lookup_fail,
+        bench_insert_erase,
+        bench_iter,
+        bench_clone,
+        bench_insert_bytes,
+        bench_lookup_bytes,
+        bench_lookup_bytes_fail,
+        bench_grow_insert_bytes,
+}
 criterion_main!(benches);

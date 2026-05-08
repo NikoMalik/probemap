@@ -18,6 +18,7 @@ use crate::alloc::{Allocator, Global, do_alloc};
 use core::arch::x86_64::*;
 
 use core::ptr::NonNull;
+
 use std::alloc::Layout;
 use std::hash::BuildHasher;
 use std::marker::PhantomData;
@@ -313,20 +314,17 @@ impl<K: std::hash::Hash + PartialEq, V> KeyExtract for PairExtract<K, V> {
 mod ctrl {
     pub(crate) const EMPTY: u8 = 0x80;
     pub(crate) const DELETED: u8 = 0xFE;
-    /// Threshold for the `match_empty_or_deleted` signed comparison trick.
-    /// As i8: EMPTY(-128) < -1 ✓, DELETED(-2) < -1 ✓, FULL(0..127) < -1 ✗
-    pub(crate) const SPECIAL_THRESHOLD: u8 = 0xFF;
 
     /// Returns true if control byte indicates an occupied slot (bit 7 clear).
     #[inline(always)]
-    pub(crate) fn is_full(c: u8) -> bool {
-        (c & 0x80) == 0
+    pub(crate) const fn is_full(c: u8) -> bool {
+        (c & EMPTY) == 0
     }
 
     /// Extract h2 from hash — top 7 bits (bits 57..63).
     /// These bits are independent from the lower bits used for positioning.
     #[inline(always)]
-    pub(crate) fn h2(hash: u64) -> u8 {
+    pub(crate) const fn h2(hash: u64) -> u8 {
         (hash >> 57) as u8
     }
 }
@@ -350,7 +348,7 @@ struct Group {
 #[cfg(target_arch = "x86_64")]
 impl Group {
     /// Unaligned load of 16 control bytes into SSE2 register.
-    #[inline]
+    #[inline(always)]
     unsafe fn load(ptr: *const u8) -> Self {
         Group {
             // SAFETY: ptr is valid for GROUP_WIDTH bytes (caller invariant of `load`).
@@ -363,7 +361,7 @@ impl Group {
     /// 1. `_mm_set1_epi8` — broadcast byte to all 16 lanes
     /// 2. `_mm_cmpeq_epi8` — per-byte compare (0xFF if equal, 0x00 if not)
     /// 3. `_mm_movemask_epi8` — extract MSB of each byte -> 16-bit mask
-    #[inline]
+    #[inline(always)]
     fn match_byte(&self, byte: u8) -> BitMask {
         // SAFETY: SSE2 intrinsics on self.ctrl which is always valid, initialized in `load`.
         unsafe {
@@ -373,34 +371,23 @@ impl Group {
     }
 
     /// Find all EMPTY slots.
-    #[inline]
+    #[inline(always)]
     fn match_empty(&self) -> BitMask {
         self.match_byte(ctrl::EMPTY)
     }
 
     /// Find all EMPTY or DELETED slots.
-    ///
-    /// Uses signed comparison: ctrl[i] < -1 is true for
-    /// EMPTY(-128) and DELETED(-2), but not for FULL(0..127).
-    #[inline]
+    #[inline(always)]
     fn match_empty_or_deleted(&self) -> BitMask {
         // SAFETY: SSE2 intrinsics on self.ctrl which is always valid, initialized in `load`.
-        unsafe {
-            let sentinel = _mm_set1_epi8(ctrl::SPECIAL_THRESHOLD as i8);
-            let cmp = _mm_cmpgt_epi8(sentinel, self.ctrl);
-            BitMask(_mm_movemask_epi8(cmp) as u16)
-        }
+        unsafe { BitMask(_mm_movemask_epi8(self.ctrl) as u16) }
     }
 
     /// Find all FULL (occupied) slots — bit 7 clear means h2 value (0x00-0x7F).
-    /// Single movemask + invert.
-    #[inline]
+    /// Single invert movemask
+    #[inline(always)]
     fn match_full(&self) -> BitMask {
-        // SAFETY: SSE2 intrinsics on self.ctrl which is always valid, initialized in `load`.
-        unsafe {
-            let mask = _mm_movemask_epi8(self.ctrl) as u16;
-            BitMask(!mask)
-        }
+        BitMask(!self.match_empty_or_deleted().0)
     }
 }
 
@@ -442,7 +429,8 @@ impl Group {
     fn match_empty_or_deleted(&self) -> BitMask {
         let mut mask: u16 = 0;
         for i in 0..GROUP_WIDTH {
-            if (self.ctrl[i] as i8) < (ctrl::SPECIAL_THRESHOLD as i8) {
+            if (self.ctrl[i] & 0x80) != 0 {
+                // high bit set
                 mask |= 1 << i;
             }
         }
@@ -472,19 +460,19 @@ const _: () = assert!(std::mem::size_of::<BitMask>() == 2);
 
 impl BitMask {
     /// Any bits set?
-    #[inline]
+    #[inline(always)]
     fn any(self) -> bool {
         self.0 != 0
     }
 
     /// Index of lowest set bit (0..15).
-    #[inline]
+    #[inline(always)]
     fn lowest_set_bit(self) -> usize {
         self.0.trailing_zeros() as usize
     }
 
     /// Clear the lowest set bit.
-    #[inline]
+    #[inline(always)]
     fn remove_lowest_bit(&mut self) {
         self.0 &= self.0 - 1;
     }
@@ -539,9 +527,34 @@ pub struct SwissTable<E: KeyExtract, S: BuildHasher = DefaultHashBuilder, A: All
     /// Stored instead of `cap` to avoid recomputing `cap - 1` on every probe.
     pub(crate) mask: usize,
     pub(crate) len: usize,
+    /// Slots remaining before a grow is needed.
+    /// Decremented on each new insertion; grow triggers when this reaches 0.
+    pub(crate) growth_left: usize,
     pub(crate) hash_builder: S,
     pub(crate) alloc: A,
     pub(crate) _marker: PhantomData<E::Value>,
+}
+
+/// Write a control byte and maintain the trailing mirror.
+///
+/// The first `GROUP_WIDTH` bytes are duplicated at `ctrl[cap..]` so that
+/// unaligned SIMD loads near the end of the array see the correct wrapped
+/// values instead of stale data.
+///
+/// Branchless: for `idx < GROUP_WIDTH` the second write hits the mirror zone
+/// `ctrl[cap + idx]`; for `idx >= GROUP_WIDTH` it harmlessly rewrites
+/// `ctrl[idx]` (the same byte).
+#[inline(always)]
+unsafe fn set_ctrl(ctrl: *mut u8, mask: usize, idx: usize, value: u8) {
+    // SAFETY: idx < cap (caller invariant), ctrl array has cap + GROUP_WIDTH bytes allocated.
+    // Mirror index: (idx.wrapping_sub(GROUP_WIDTH) & mask) + GROUP_WIDTH
+    //   idx < 16 → wraps high, mask keeps low bits → cap + idx - 16 + 16 = cap + idx (mirror)
+    //   idx >= 16 → (idx - 16) & mask + 16 = idx (harmless self-write)
+    unsafe {
+        let mirror = (idx.wrapping_sub(GROUP_WIDTH) & mask) + GROUP_WIDTH;
+        *ctrl.add(idx) = value;
+        *ctrl.add(mirror) = value;
+    }
 }
 
 impl<E: KeyExtract, S: BuildHasher + Clone, A: Allocator + Clone> Clone for SwissTable<E, S, A>
@@ -553,8 +566,13 @@ where
     }
 }
 
-/// Load factor threshold: grow when `len >= cap * 87 / 100`.
-const LOAD_FACTOR_NUMERATOR: usize = 87;
+/// Compute how many slots can be filled before growing.
+/// Load factor ≈ 7/8 (87.5%), matching hashbrown.
+/// `(cap / 8) * 7` compiles to shift + subtract - no division.
+#[inline(always)]
+fn bucket_mask_to_capacity(mask: usize) -> usize {
+    if mask == 0 { 0 } else { ((mask + 1) / 8) * 7 }
+}
 
 impl<E: KeyExtract, S: BuildHasher + Default, A: Allocator + Default> Default
     for SwissTable<E, S, A>
@@ -586,6 +604,7 @@ impl<E: KeyExtract, S: BuildHasher> SwissTable<E, S, Global> {
             slots: NonNull::dangling(),
             mask: 0,
             len: 0,
+            growth_left: 0,
             hash_builder,
             alloc: Global,
             _marker: PhantomData,
@@ -600,13 +619,15 @@ impl<E: KeyExtract, S: BuildHasher> SwissTable<E, S, Global> {
                 .max(GROUP_WIDTH)
                 .checked_next_power_of_two()
                 .expect("capacity overflow");
-            // SAFETY: alloc_ctrl/alloc_slots succeeded (unwrap), writing EMPTY to freshly allocated memory.
+            // SAFETY: alloc_table succeeded (unwrap), writing EMPTY to freshly allocated memory.
             unsafe {
-                table.ctrl = Self::alloc_ctrl(cap, &table.alloc).unwrap();
-                table.slots = Self::alloc_slots(cap, &table.alloc).unwrap();
+                let (ctrl, slots) = Self::alloc_table(cap, &table.alloc).unwrap();
+                table.ctrl = ctrl;
+                table.slots = slots;
                 let cp = table.ctrl_ptr();
                 ptr::write_bytes(cp, ctrl::EMPTY, cap + GROUP_WIDTH);
                 table.mask = cap - 1;
+                table.growth_left = bucket_mask_to_capacity(cap - 1);
             }
         }
         table
@@ -627,13 +648,15 @@ impl<E: KeyExtract, S: BuildHasher + Default, A: Allocator> SwissTable<E, S, A> 
                 .max(GROUP_WIDTH)
                 .checked_next_power_of_two()
                 .expect("capacity overflow");
-            // SAFETY: alloc_ctrl/alloc_slots succeeded (unwrap), writing EMPTY to freshly allocated memory.
+            // SAFETY: alloc_table succeeded (unwrap), writing EMPTY to freshly allocated memory.
             unsafe {
-                table.ctrl = Self::alloc_ctrl(cap, &table.alloc).unwrap();
-                table.slots = Self::alloc_slots(cap, &table.alloc).unwrap();
+                let (ctrl, slots) = Self::alloc_table(cap, &table.alloc).unwrap();
+                table.ctrl = ctrl;
+                table.slots = slots;
                 let cp = table.ctrl_ptr();
                 ptr::write_bytes(cp, ctrl::EMPTY, cap + GROUP_WIDTH);
                 table.mask = cap - 1;
+                table.growth_left = bucket_mask_to_capacity(cap - 1);
             }
         }
         table
@@ -648,6 +671,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             slots: NonNull::dangling(),
             mask: 0,
             len: 0,
+            growth_left: 0,
             hash_builder,
             alloc,
             _marker: PhantomData,
@@ -684,64 +708,54 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         self.slots.as_ptr()
     }
 
-    /// Write a control byte and maintain the trailing mirror.
-    ///
-    /// The first `GROUP_WIDTH` bytes are duplicated at `ctrl[cap..]` so that
-    /// unaligned SIMD loads near the end of the array see the correct wrapped
-    /// values instead of stale data.
-    #[inline(always)]
-    unsafe fn set_ctrl(&self, idx: usize, value: u8) {
-        // SAFETY: idx < cap (caller invariant), ctrl array has cap + GROUP_WIDTH bytes allocated.
-        unsafe {
-            *self.ctrl_ptr().add(idx) = value;
-            if idx < GROUP_WIDTH {
-                *self.ctrl_ptr().add(self.mask + 1 + idx) = value;
-            }
-        }
-    }
-
     /// Lazy-init: allocate minimum capacity in-place (without moving the allocator).
+    #[cold]
+    #[inline(never)]
     fn ensure_capacity(&mut self) {
         debug_assert_eq!(self.mask, 0);
         let cap = GROUP_WIDTH;
-        // SAFETY: alloc_ctrl/alloc_slots succeeded (unwrap), writing EMPTY to freshly allocated memory.
+        // SAFETY: alloc_table succeeded (unwrap), writing EMPTY to freshly allocated memory.
         unsafe {
-            self.ctrl = Self::alloc_ctrl(cap, &self.alloc).unwrap();
-            self.slots = Self::alloc_slots(cap, &self.alloc).unwrap();
+            let (ctrl, slots) = Self::alloc_table(cap, &self.alloc).unwrap();
+            self.ctrl = ctrl;
+            self.slots = slots;
             let cp = self.ctrl_ptr();
             ptr::write_bytes(cp, ctrl::EMPTY, cap + GROUP_WIDTH);
             self.mask = cap - 1;
+            self.growth_left = bucket_mask_to_capacity(cap - 1);
         }
     }
 
-    /// Allocate control bytes array, aligned to GROUP_WIDTH (16).
-    unsafe fn alloc_ctrl<AA: Allocator>(cap: usize, a: &AA) -> Option<NonNull<u8>> {
-        let layout = Layout::from_size_align(cap + GROUP_WIDTH, GROUP_WIDTH).unwrap();
-        do_alloc(a, layout).ok()
+    /// Compute the combined layout for `[ctrl | padding | slots]`.
+    /// Returns `(layout, slots_offset)`.
+    #[inline(always)]
+    fn table_layout(cap: usize) -> (Layout, usize) {
+        let ctrl = Layout::from_size_align(cap + GROUP_WIDTH, GROUP_WIDTH).unwrap();
+        let slots = Layout::array::<MaybeUninit<E::Value>>(cap).unwrap();
+        ctrl.extend(slots).unwrap()
     }
 
-    /// Allocate slots array.
-    unsafe fn alloc_slots<AA: Allocator>(
+    /// Allocate a single block for ctrl + slots.
+    /// Returns `(ctrl_ptr, slots_ptr)`.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    unsafe fn alloc_table<AA: Allocator>(
         cap: usize,
         a: &AA,
-    ) -> Option<NonNull<MaybeUninit<E::Value>>> {
-        let layout = Layout::array::<MaybeUninit<E::Value>>(cap).unwrap();
+    ) -> Option<(NonNull<u8>, NonNull<MaybeUninit<E::Value>>)> {
+        let (layout, slots_offset) = Self::table_layout(cap);
         let ptr = do_alloc(a, layout).ok()?;
-        Some(ptr.cast::<MaybeUninit<E::Value>>())
+        // SAFETY: slots_offset is within the allocation computed by Layout::extend.
+        let slots = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(slots_offset).cast()) };
+        Some((ptr, slots))
     }
 
-    /// Free control bytes array via allocator.
-    unsafe fn dealloc_ctrl(ctrl: NonNull<u8>, cap: usize, alloc: &A) {
-        let layout = Layout::from_size_align(cap + GROUP_WIDTH, GROUP_WIDTH).unwrap();
-        // SAFETY: layout matches the one used in alloc_ctrl, ctrl was allocated by this allocator.
+    /// Free the combined ctrl + slots allocation.
+    #[inline(always)]
+    unsafe fn dealloc_table(ctrl: NonNull<u8>, cap: usize, alloc: &A) {
+        let (layout, _) = Self::table_layout(cap);
+        // SAFETY: layout matches the one used in alloc_table, ctrl was allocated by this allocator.
         unsafe { alloc.deallocate(ctrl, layout) };
-    }
-
-    /// Free slots array via allocator.
-    unsafe fn dealloc_slots(slots: NonNull<MaybeUninit<E::Value>>, cap: usize, alloc: &A) {
-        let layout = Layout::array::<MaybeUninit<E::Value>>(cap).unwrap();
-        // SAFETY: layout matches the one used in alloc_slots, slots was allocated by this allocator.
-        unsafe { alloc.deallocate(slots.cast::<u8>(), layout) };
     }
 
     /// Initial probe position from lower bits of hash.
@@ -776,7 +790,11 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     /// Current capacity (number of slots, not accounting for load factor).
     #[inline]
     pub fn capacity(&self) -> usize {
-        if self.mask == 0 { 0 } else { self.mask + 1 }
+        if unlikely(self.mask == 0) {
+            0
+        } else {
+            self.mask + 1
+        }
     }
 
     /// Insert a value (or update existing by key).
@@ -784,42 +802,53 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     /// If the key already exists, the value is overwritten.
     /// Grows automatically when load factor is exceeded.
     pub fn insert(&mut self, value: E::Value) {
-        if unlikely(self.mask == 0) {
-            self.ensure_capacity();
-        }
-        if unlikely(self.len >= ((self.mask + 1) * LOAD_FACTOR_NUMERATOR) / 100) {
-            self.grow();
+        if unlikely(self.growth_left == 0) {
+            self.reserve_for_insert();
         }
         self.insert_inner(value);
     }
 
+    #[cold]
+    #[inline(never)]
+    fn reserve_for_insert(&mut self) {
+        if self.mask == 0 {
+            self.ensure_capacity();
+        } else {
+            self.grow();
+        }
+    }
+
     /// Fast insert for rehash — no duplicate check, no deleted slots.
     /// Only valid on a freshly allocated table (all EMPTY, no DELETED).
-    #[inline]
+    #[inline(always)]
     fn insert_assume_unique(&mut self, value: E::Value) {
         let hash = self.make_hash(E::extract(&value));
         let h2 = ctrl::h2(hash);
         let mut pos = self.probe_start(hash);
+        let ctrl = self.ctrl_ptr();
+        let slots = self.slots_ptr();
+        let mask = self.mask;
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
-            let group = unsafe { Group::load(self.ctrl_ptr().add(pos)) };
+            let group = unsafe { Group::load(ctrl.add(pos)) };
             let empty = group.match_empty();
             if likely(empty.any()) {
-                let idx = (pos + empty.lowest_set_bit()) & self.mask;
+                let idx = (pos + empty.lowest_set_bit()) & mask;
                 // SAFETY: idx < cap (masked), slot is valid uninitialized memory from alloc_slots.
                 unsafe {
-                    self.set_ctrl(idx, h2);
-                    ptr::write(self.slots_ptr().add(idx), MaybeUninit::new(value));
+                    set_ctrl(ctrl, mask, idx, h2);
+                    ptr::write(slots.add(idx), MaybeUninit::new(value));
                 }
                 self.len += 1;
+                self.growth_left -= 1;
                 return;
             }
             pos = self.next_group(pos);
         }
     }
 
-    /// Inner insert with duplicate check.
+    // /// Inner insert with duplicate check.
     #[inline]
     fn insert_inner(&mut self, value: E::Value) {
         let key = E::extract(&value);
@@ -827,25 +856,29 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
-        let mut first_empty: usize = usize::MAX; // sentinel: no candidate yet
+        let mut insert_slot: usize = usize::MAX; // sentinel: no candidate yet
+        let ctrl = self.ctrl_ptr();
+        let slots = self.slots_ptr();
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
-            let group = unsafe { Group::load(self.ctrl_ptr().add(pos)) };
+            let group = unsafe { Group::load(ctrl.add(pos)) };
 
             let mut mask = group.match_byte(h2);
             while mask.any() {
                 let bit = mask.lowest_set_bit();
                 let idx = (pos + bit) & cap_mask;
                 // SAFETY: idx < cap (masked), slot is initialized (ctrl byte matched h2, so slot is FULL).
-                let slot_ptr = unsafe { self.slots_ptr().add(idx) };
-                let val_ptr = slot_ptr as *const E::Value;
+                let slot_ptr = unsafe { slots.add(idx) };
+                let val_ptr = slot_ptr.cast::<E::Value>();
                 // SAFETY: val_ptr points to initialized Value (slot is FULL, confirmed by h2 match).
                 let slot_ref = unsafe { &*val_ptr };
                 if unlikely(E::extract(slot_ref) == key) {
                     // SAFETY: overwriting existing value: drop old, write new. idx is a valid FULL slot.
                     unsafe {
-                        ptr::drop_in_place(slot_ptr.cast::<E::Value>());
+                        if core::mem::needs_drop::<E::Value>() {
+                            ptr::drop_in_place(slot_ptr);
+                        }
                         ptr::write(slot_ptr, MaybeUninit::new(value));
                     }
                     return;
@@ -853,23 +886,33 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 mask.remove_lowest_bit();
             }
 
-            // Track first empty/deleted slot in probe order
-            if likely(first_empty == usize::MAX) {
-                let empty_del = group.match_empty_or_deleted();
-                if empty_del.any() {
-                    first_empty = (pos + empty_del.lowest_set_bit()) & cap_mask;
-                }
-            }
-
-            if likely(group.match_empty().any()) {
-                let idx = first_empty;
-                // SAFETY: idx from first_empty which was < cap (masked). Writing to empty/deleted slot.
+            // Check for EMPTY — ends the probe chain.
+            // On the common path (no tombstones) this is the only check needed,
+            // saving the match_empty_or_deleted SIMD op.
+            let empty = group.match_empty();
+            if likely(empty.any()) {
+                let idx = if unlikely(insert_slot != usize::MAX) {
+                    insert_slot
+                } else {
+                    (pos + empty.lowest_set_bit()) & cap_mask
+                };
+                // SAFETY: idx < cap (masked). Writing to empty/deleted slot.
                 unsafe {
-                    self.set_ctrl(idx, h2);
-                    ptr::write(self.slots_ptr().add(idx), MaybeUninit::new(value));
+                    set_ctrl(ctrl, cap_mask, idx, h2);
+                    ptr::write(slots.add(idx), MaybeUninit::new(value));
                 }
                 self.len += 1;
+                self.growth_left -= 1;
                 return;
+            }
+
+            // No EMPTY in this group - probe chain continues.
+            // Track first DELETED slot as potential insert position.
+            if insert_slot == usize::MAX {
+                let empty_del = group.match_empty_or_deleted();
+                if likely(empty_del.any()) {
+                    insert_slot = (pos + empty_del.lowest_set_bit()) & cap_mask;
+                }
             }
 
             pos = self.next_group(pos);
@@ -885,16 +928,18 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
+        let ctrl = self.ctrl_ptr();
+        let slots = self.slots_ptr();
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
-            let group = unsafe { Group::load(self.ctrl_ptr().add(pos)) };
+            let group = unsafe { Group::load(ctrl.add(pos)) };
             let mut mask = group.match_byte(h2);
             while mask.any() {
                 let bit = mask.lowest_set_bit();
                 let idx = (pos + bit) & cap_mask;
                 // SAFETY: idx < cap (masked), slot is FULL (h2 matched).
-                let val_ptr = unsafe { self.slots_ptr().add(idx) } as *const E::Value;
+                let val_ptr = unsafe { slots.add(idx).cast::<E::Value>() };
                 // SAFETY: val_ptr points to initialized Value (FULL slot).
                 let slot_ref = unsafe { &*val_ptr };
                 if E::extract(slot_ref) == key {
@@ -910,12 +955,14 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     }
 
     /// Get a reference to the value for the given key.
+    #[inline]
     pub fn get(&self, key: &E::Key) -> Option<&E::Value> {
         // SAFETY: get_inner returns pointer to initialized Value in a FULL slot; lifetime tied to &self.
         unsafe { self.get_inner(key).map(|p| &*p) }
     }
 
     /// Get a mutable reference to the value for the given key.
+    #[inline]
     pub fn get_mut(&mut self, key: &E::Key) -> Option<&mut E::Value> {
         // SAFETY: get_inner returns pointer to initialized Value in a FULL slot; &mut self ensures exclusive access.
         unsafe { self.get_inner(key).map(|p| &mut *p.cast_mut()) }
@@ -930,23 +977,27 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
+        let ctrl = self.ctrl_ptr();
+        let slots = self.slots_ptr();
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
-            let group = unsafe { Group::load(self.ctrl_ptr().add(pos)) };
+            let group = unsafe { Group::load(ctrl.add(pos)) };
             let mut mask = group.match_byte(h2);
             while mask.any() {
                 let bit = mask.lowest_set_bit();
                 let idx = (pos + bit) & cap_mask;
                 // SAFETY: idx < cap (masked), slot is FULL (h2 matched).
-                let val_ptr = unsafe { self.slots_ptr().add(idx) } as *const E::Value;
+                let val_ptr = unsafe { slots.add(idx) } as *const E::Value;
                 // SAFETY: val_ptr points to initialized Value (FULL slot).
                 let slot_ref = unsafe { &*val_ptr };
                 if E::extract(slot_ref) == key {
                     // SAFETY: dropping initialized value in FULL slot, marking as DELETED.
                     unsafe {
-                        ptr::drop_in_place(self.slots_ptr().add(idx).cast::<E::Value>());
-                        self.set_ctrl(idx, ctrl::DELETED);
+                        if core::mem::needs_drop::<E::Value>() {
+                            ptr::drop_in_place(slots.add(idx).cast::<E::Value>());
+                        }
+                        set_ctrl(ctrl, cap_mask, idx, ctrl::DELETED);
                     }
                     self.len -= 1;
                     return true;
@@ -961,24 +1012,25 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     }
 
     /// Remove an element by key. Returns `true` if the key was found.
+    #[inline]
     pub fn remove(&mut self, key: &E::Key) -> bool {
         self.remove_inner(key)
     }
 
     /// Returns true if the key exists.
+    #[inline]
     pub fn contains(&self, key: &E::Key) -> bool {
         self.get(key).is_some()
     }
 
     /// Get or insert: returns `&mut` to existing value if key found,
     /// otherwise inserts `value` and returns `&mut` to the new entry.
+    #[inline]
     pub fn get_or_insert(&mut self, value: E::Value) -> &mut E::Value {
-        if unlikely(self.mask == 0) {
-            self.ensure_capacity();
+        if unlikely(self.growth_left == 0) {
+            self.reserve_for_insert();
         }
-        if unlikely(self.len >= ((self.mask + 1) * LOAD_FACTOR_NUMERATOR) / 100) {
-            self.grow();
-        }
+
         self.get_or_insert_inner(value)
     }
 
@@ -988,17 +1040,19 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
-        let mut first_empty: usize = usize::MAX;
+        let mut insert_slot: usize = usize::MAX;
+        let ctrl = self.ctrl_ptr();
+        let slots = self.slots_ptr();
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
-            let group = unsafe { Group::load(self.ctrl_ptr().add(pos)) };
+            let group = unsafe { Group::load(ctrl.add(pos)) };
             let mut mask = group.match_byte(h2);
             while mask.any() {
                 let bit = mask.lowest_set_bit();
                 let idx = (pos + bit) & cap_mask;
                 // SAFETY: idx < cap (masked), slot is FULL (h2 matched).
-                let val_ptr = unsafe { self.slots_ptr().add(idx) }.cast::<E::Value>();
+                let val_ptr = unsafe { slots.add(idx) }.cast::<E::Value>();
                 // SAFETY: FULL slot, &mut self ensures exclusive access.
                 let slot_ref = unsafe { &mut *val_ptr };
                 if E::extract(slot_ref) == E::extract(&value) {
@@ -1007,23 +1061,29 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 mask.remove_lowest_bit();
             }
 
-            if unlikely(first_empty == usize::MAX) {
-                let empty_del = group.match_empty_or_deleted();
-                if empty_del.any() {
-                    first_empty = (pos + empty_del.lowest_set_bit()) & cap_mask;
-                }
-            }
-
-            if likely(group.match_empty().any()) {
-                let idx = first_empty;
-                // SAFETY: idx from first_empty which was < cap (masked). Writing to empty/deleted slot.
+            let empty = group.match_empty();
+            if likely(empty.any()) {
+                let idx = if unlikely(insert_slot != usize::MAX) {
+                    insert_slot
+                } else {
+                    (pos + empty.lowest_set_bit()) & cap_mask
+                };
+                // SAFETY: idx < cap (masked). Writing to empty/deleted slot.
                 unsafe {
-                    self.set_ctrl(idx, h2);
-                    ptr::write(self.slots_ptr().add(idx), MaybeUninit::new(value));
+                    set_ctrl(ctrl, cap_mask, idx, h2);
+                    ptr::write(slots.add(idx), MaybeUninit::new(value));
                 }
                 self.len += 1;
+                self.growth_left -= 1;
                 // SAFETY: just wrote value at idx, it is initialized.
-                return unsafe { &mut *(self.slots_ptr().add(idx).cast::<E::Value>()) };
+                return unsafe { &mut *(slots.add(idx).cast::<E::Value>()) };
+            }
+
+            if unlikely(insert_slot == usize::MAX) {
+                let empty_del = group.match_empty_or_deleted();
+                if empty_del.any() {
+                    insert_slot = (pos + empty_del.lowest_set_bit()) & cap_mask;
+                }
             }
 
             pos = self.next_group(pos);
@@ -1031,21 +1091,36 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     }
 
     /// Drop all values and mark all slots as EMPTY.
+    #[inline]
     pub fn clear(&mut self) {
-        if self.mask == 0 {
+        if unlikely(self.mask == 0) {
             return;
         }
+        let ctrl = self.ctrl_ptr();
+        let slots = self.slots_ptr();
+
         let cap = self.mask + 1;
-        // SAFETY: mask > 0 so cap > 0, iterating valid ctrl/slots range, dropping FULL slots.
+        // SAFETY: mask > 0 so cap > 0, dropping FULL slots via SIMD group scan, then resetting ctrl.
         unsafe {
-            for i in 0..cap {
-                if ctrl::is_full(*self.ctrl_ptr().add(i)) {
-                    ptr::drop_in_place(self.slots_ptr().add(i).cast::<E::Value>());
+            if core::mem::needs_drop::<E::Value>() {
+                let mut group_pos = 0;
+                while group_pos < cap {
+                    let mut full = Group::load(ctrl.add(group_pos)).match_full();
+                    while full.any() {
+                        let bit = full.lowest_set_bit();
+                        if core::mem::needs_drop::<E::Value>() {
+                            ptr::drop_in_place(slots.add(group_pos + bit).cast::<E::Value>());
+                        }
+
+                        full.remove_lowest_bit();
+                    }
+                    group_pos += GROUP_WIDTH;
                 }
             }
-            ptr::write_bytes(self.ctrl_ptr(), ctrl::EMPTY, cap + GROUP_WIDTH);
+            ptr::write_bytes(ctrl, ctrl::EMPTY, cap + GROUP_WIDTH);
         }
         self.len = 0;
+        self.growth_left = bucket_mask_to_capacity(self.mask);
     }
 
     /// Deep-copy the table.
@@ -1058,14 +1133,13 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         S: Clone,
         A: Clone,
     {
-        if self.mask == 0 {
+        if unlikely(self.mask == 0) {
             return Self::with_hasher_and_alloc(self.hash_builder.clone(), self.alloc.clone());
         }
         let cap = self.mask + 1;
-        // SAFETY: freshly allocated ctrl/slots via alloc_ctrl/alloc_slots, source table valid.
+        // SAFETY: freshly allocated table via alloc_table, source table valid.
         unsafe {
-            let ctrl = Self::alloc_ctrl(cap, &self.alloc).unwrap();
-            let slots = Self::alloc_slots(cap, &self.alloc).unwrap();
+            let (ctrl, slots) = Self::alloc_table(cap, &self.alloc).unwrap();
 
             let cp = ctrl.as_ptr();
             let sp = slots.as_ptr();
@@ -1092,6 +1166,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 slots,
                 mask: self.mask,
                 len: self.len,
+                growth_left: self.growth_left,
                 hash_builder: self.hash_builder.clone(),
                 alloc: self.alloc.clone(),
                 _marker: PhantomData,
@@ -1101,9 +1176,11 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
     /// Iterator over all values. Uses SIMD group scan to skip empty regions.
     pub fn iter(&self) -> Iter<'_, E, S, A> {
+        let ctrl = self.ctrl_ptr();
+
         let bitmask = if self.mask > 0 {
             // SAFETY: mask > 0 so cap > 0, ctrl_ptr() points to valid ctrl array with cap + GROUP_WIDTH bytes.
-            unsafe { Group::load(self.ctrl_ptr()) }.match_full()
+            unsafe { Group::load(ctrl) }.match_full()
         } else {
             BitMask(0)
         };
@@ -1137,19 +1214,21 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
     /// Double capacity and rehash all elements.
     /// O(n). Deleted slots are cleaned up during rehash.
+    #[cold]
+    #[inline(never)]
     fn grow(&mut self) {
-        let old_cap = if self.mask == 0 { 0 } else { self.mask + 1 };
+        debug_assert!(self.mask != 0);
+        let old_cap = self.capacity();
         let new_cap = if old_cap == 0 {
             GROUP_WIDTH
         } else {
-            old_cap.checked_mul(2).expect("capacity overflow on grow")
+            old_cap.checked_mul(2).expect("capacity overflow")
         };
 
-        // SAFETY: freshly allocated new_ctrl/new_slots; old pointers saved before overwriting struct
-        // fields; rehash moves all FULL elements; then deallocs old arrays with matching layouts.
+        // SAFETY: freshly allocated new table; old pointers saved before overwriting struct
+        // fields; rehash moves all FULL elements; then deallocs old table with matching layout.
         unsafe {
-            let new_ctrl = Self::alloc_ctrl(new_cap, &self.alloc).unwrap();
-            let new_slots = Self::alloc_slots(new_cap, &self.alloc).unwrap();
+            let (new_ctrl, new_slots) = Self::alloc_table(new_cap, &self.alloc).unwrap();
             let ncp = new_ctrl.as_ptr();
             ptr::write_bytes(ncp, ctrl::EMPTY, new_cap + GROUP_WIDTH);
 
@@ -1160,19 +1239,24 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             self.slots = new_slots;
             self.mask = new_cap - 1;
             self.len = 0;
+            self.growth_left = bucket_mask_to_capacity(new_cap - 1);
 
-            // Rehash: move (not clone) all FULL elements
+            // Rehash: move (not clone) all FULL elements via SIMD group scan
             if old_cap > 0 {
                 let ocp = old_ctrl.as_ptr();
                 let osp = old_slots.as_ptr();
-                for i in 0..old_cap {
-                    if ctrl::is_full(*ocp.add(i)) {
-                        let value = ptr::read(osp.add(i) as *const E::Value);
+                let mut group_pos = 0;
+                while group_pos < old_cap {
+                    let mut full = Group::load(ocp.add(group_pos)).match_full();
+                    while full.any() {
+                        let bit = full.lowest_set_bit();
+                        let value = ptr::read(osp.add(group_pos + bit).cast::<E::Value>());
                         self.insert_assume_unique(value);
+                        full.remove_lowest_bit();
                     }
+                    group_pos += GROUP_WIDTH;
                 }
-                Self::dealloc_ctrl(old_ctrl, old_cap, &self.alloc);
-                Self::dealloc_slots(old_slots, old_cap, &self.alloc);
+                Self::dealloc_table(old_ctrl, old_cap, &self.alloc);
             }
         }
     }
@@ -1187,16 +1271,24 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> Drop for SwissTable<E, S, A> {
         if unlikely(self.mask == 0) {
             return;
         }
+        let ctrl = self.ctrl_ptr();
+        let slots = self.slots_ptr();
         let cap = self.mask + 1;
-        // SAFETY: mask > 0 so cap > 0, dropping all FULL slots then deallocating both arrays with matching layouts.
+        // SAFETY: mask > 0 so cap > 0, dropping FULL slots via SIMD group scan, then deallocating.
         unsafe {
-            for i in 0..cap {
-                if ctrl::is_full(*self.ctrl_ptr().add(i)) {
-                    ptr::drop_in_place(self.slots_ptr().add(i).cast::<E::Value>());
+            if std::mem::needs_drop::<E::Value>() {
+                let mut group_pos = 0;
+                while group_pos < cap {
+                    let mut full = Group::load(ctrl.add(group_pos)).match_full();
+                    while full.any() {
+                        let bit = full.lowest_set_bit();
+                        ptr::drop_in_place(slots.add(group_pos + bit).cast::<E::Value>());
+                        full.remove_lowest_bit();
+                    }
+                    group_pos += GROUP_WIDTH;
                 }
             }
-            Self::dealloc_ctrl(self.ctrl, cap, &self.alloc);
-            Self::dealloc_slots(self.slots, cap, &self.alloc);
+            Self::dealloc_table(self.ctrl, cap, &self.alloc);
         }
     }
 }
@@ -1217,18 +1309,21 @@ impl<'a, E: KeyExtract, S: BuildHasher, A: Allocator> Iterator for Iter<'a, E, S
         // group_pos + bit < cap. Slot at idx is FULL (match_full bitmask). Group::load at
         // group_pos is within ctrl bounds (cap + GROUP_WIDTH allocated).
         unsafe {
+            let ctrl = self.table.ctrl_ptr();
+            let slots = self.table.slots_ptr();
+
             loop {
                 if self.bitmask.any() {
                     let bit = self.bitmask.lowest_set_bit();
                     self.bitmask.remove_lowest_bit();
                     let idx = self.group_pos + bit;
-                    return Some(&*(self.table.slots_ptr().add(idx).cast::<E::Value>()));
+                    return Some(&*(slots.add(idx).cast::<E::Value>()));
                 }
                 self.group_pos += GROUP_WIDTH;
                 if self.group_pos > self.table.mask {
                     return None;
                 }
-                let group = Group::load(self.table.ctrl_ptr().add(self.group_pos));
+                let group = Group::load(ctrl.add(self.group_pos));
                 self.bitmask = group.match_full();
             }
         }
