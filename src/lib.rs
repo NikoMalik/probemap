@@ -524,13 +524,22 @@ unsafe fn prefetch_read(ptr: *const u8) {
     unsafe { _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_T0) };
 }
 
+/// Prefetch with non-temporal hint – data used once, discard quickly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse")]
+#[inline]
+unsafe fn prefetch_nta(ptr: *const u8) {
+    // SAFETY: _mm_prefetch is a hint only with no memory safety requirements; ptr may be invalid.
+    unsafe { _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_NTA) };
+}
+
 /// Prefetch data into L2+ cache.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse")]
 #[inline]
 unsafe fn prefetch_read_l2(ptr: *const u8) {
     // SAFETY: _mm_prefetch is a hint only with no memory safety requirements; ptr may be invalid.
-    unsafe { _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_T1) };
+    unsafe { _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_T2) };
 }
 
 /// No-op prefetch on non-x86_64.
@@ -540,6 +549,9 @@ unsafe fn prefetch_read(_ptr: *const u8) {}
 /// No-op prefetch on non-x86_64.
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn prefetch_read_l2(_ptr: *const u8) {}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn prefetch_nta(ptr: *const u8) {}
 
 // =============================================================================
 // SwissTable
@@ -961,6 +973,13 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let mut pos = self.probe_start(hash);
         let mut insert_slot: usize = usize::MAX; // sentinel: no candidate yet
         let ctrl = self.ctrl_ptr();
+        // // SAFETY: hint only with no memory touches
+        unsafe {
+            // Prefetch the heap-allocated memory region to resolve potential TLB and
+            // cache misses. This is intended to overlap with execution of calculating the
+            // hash for a key.
+            prefetch_nta(ctrl);
+        }
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
@@ -975,7 +994,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 let val_ptr = slot_ptr.cast::<E::Value>();
                 // SAFETY: val_ptr points to initialized Value (slot is FULL, confirmed by h2 match).
                 let slot_ref = unsafe { &*val_ptr };
-                if E::extract(slot_ref) == key {
+                if unlikely(E::extract(slot_ref) == key) {
                     // SAFETY: overwriting existing value: drop old, write new. idx is a valid FULL slot.
                     unsafe {
                         if core::mem::needs_drop::<E::Value>() {
@@ -1036,11 +1055,20 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         if unlikely(self.mask == 0) {
             return None;
         }
+
         let hash = self.hash_builder.hash_one(key);
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
         let ctrl = self.ctrl_ptr();
+        // SAFETY: hint only with no memory touches
+        unsafe {
+            // Prefetch the heap-allocated memory region to resolve potential TLB and
+            // cache misses. This is intended to overlap with execution of calculating the
+            // hash for a key.
+
+            prefetch_nta(ctrl);
+        }
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
@@ -1168,6 +1196,10 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let mut pos = self.probe_start(hash);
         let mut insert_slot: usize = usize::MAX;
         let ctrl = self.ctrl_ptr();
+        // SAFETY: hint only with no memory touches
+        unsafe {
+            prefetch_nta(ctrl);
+        }
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
