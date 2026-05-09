@@ -975,7 +975,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 let val_ptr = slot_ptr.cast::<E::Value>();
                 // SAFETY: val_ptr points to initialized Value (slot is FULL, confirmed by h2 match).
                 let slot_ref = unsafe { &*val_ptr };
-                if unlikely(E::extract(slot_ref) == key) {
+                if E::extract(slot_ref) == key {
                     // SAFETY: overwriting existing value: drop old, write new. idx is a valid FULL slot.
                     unsafe {
                         if core::mem::needs_drop::<E::Value>() {
@@ -1017,7 +1017,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
             // No EMPTY in this group - probe chain continues.
             // Track first DELETED slot as potential insert position.
-            if insert_slot == usize::MAX {
+            if unlikely(insert_slot == usize::MAX) {
                 let empty_del = group.match_empty_or_deleted();
                 if likely(empty_del.any()) {
                     insert_slot = (pos + empty_del.lowest_set_bit()) & cap_mask;

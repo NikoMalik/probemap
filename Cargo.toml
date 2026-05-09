@@ -1,6 +1,6 @@
 [package]
 name = "probemap"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "A flat hash map based on Google's SwissTable design (used in Abseil C++)"                                                                                
 license = "Apache-2.0"                                                                                                                                                  
@@ -69,6 +69,7 @@ hashbrown = "0.15"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+opt-level=3
 
 
 [[bench]]
