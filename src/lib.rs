@@ -48,6 +48,7 @@ where
     Q: Eq,
     K: core::borrow::Borrow<Q>,
 {
+    #[inline(always)]
     fn equivalent(&self, key: &K) -> bool {
         self == key.borrow()
     }
@@ -186,7 +187,6 @@ impl AutoHasher {
         self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
     }
 
-    #[allow(dead_code)]
     #[inline]
     fn fx_bytes(&mut self, bytes: &[u8]) {
         let mut chunks = bytes.chunks_exact(8);
@@ -381,6 +381,15 @@ impl Group {
         Group {
             // SAFETY: ptr is valid for GROUP_WIDTH bytes (caller invariant of `load`).
             ctrl: unsafe { _mm_loadu_si128(ptr.cast::<__m128i>()) },
+        }
+    }
+
+    /// Aligned load of 16 control bytes into SSE2 register.
+    #[inline(always)]
+    unsafe fn load_aligned(ptr: *const u8) -> Self {
+        Group {
+            // SAFETY: ptr is valid for GROUP_WIDTH bytes (caller invariant of `load`).
+            ctrl: unsafe { _mm_load_si128(ptr.cast::<__m128i>()) },
         }
     }
 
@@ -619,7 +628,7 @@ where
 /// `(cap / 8) * 7` compiles to shift + subtract - no division.
 #[inline(always)]
 fn bucket_mask_to_capacity(mask: usize) -> usize {
-    if mask == 0 { 0 } else { ((mask + 1) / 8) * 7 }
+    ((mask + 1) / 8) * 7
 }
 
 impl<E: KeyExtract, S: BuildHasher + Default, A: Allocator + Default> Default
@@ -874,19 +883,42 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     /// If the key already exists, the value is overwritten.
     /// Grows automatically when load factor is exceeded.
     pub fn insert(&mut self, value: E::Value) {
-        if unlikely(self.growth_left == 0) {
-            self.reserve_for_insert();
+        if unlikely(self.mask == 0) {
+            self.ensure_capacity();
+            self.insert_inner(value);
+            return;
         }
         self.insert_inner(value);
     }
 
-    #[cold]
-    #[inline(never)]
-    fn reserve_for_insert(&mut self) {
-        if self.mask == 0 {
-            self.ensure_capacity();
-        } else {
-            self.grow();
+    /// Fast insert for rehash — no duplicate check, no deleted slots.
+    /// Only valid on a freshly allocated table (all EMPTY, no DELETED).
+    /// Returns a mutable reference to the inserted value.
+    #[inline(always)]
+    fn insert_assume_unique_return(&mut self, value: E::Value) -> &mut E::Value {
+        let hash = self.make_hash(E::extract(&value));
+        let h2 = ctrl::h2(hash);
+        let mut pos = self.probe_start(hash);
+        let ctrl = self.ctrl_ptr();
+        let mask = self.mask;
+
+        loop {
+            // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
+            let group = unsafe { Group::load(ctrl.add(pos)) };
+            let empty = group.match_empty();
+            if likely(empty.any()) {
+                let idx = (pos + empty.lowest_set_bit()) & mask;
+                // SAFETY: idx < cap (masked), slot is valid uninitialized memory from alloc_slots.
+                unsafe {
+                    set_ctrl(ctrl, mask, idx, h2);
+                    ptr::write(self.slot_mut(idx), MaybeUninit::new(value));
+                }
+                self.len += 1;
+                self.growth_left -= 1;
+                // SAFETY: slot initialized
+                return unsafe { &mut *self.slot_mut(idx).cast::<E::Value>() };
+            }
+            pos = self.next_group(pos);
         }
     }
 
@@ -966,6 +998,13 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 } else {
                     (pos + empty.lowest_set_bit()) & cap_mask
                 };
+
+                if unlikely(self.growth_left == 0) {
+                    self.grow();
+                    self.insert_assume_unique(value);
+                    return;
+                }
+
                 // SAFETY: idx < cap (masked). Writing to empty/deleted slot.
                 unsafe {
                     set_ctrl(ctrl, cap_mask, idx, h2);
@@ -1014,7 +1053,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 let val_ptr = self.slot_mut(idx).cast::<E::Value>();
                 // SAFETY: val_ptr points to initialized Value (FULL slot).
                 let slot_ref = unsafe { &*val_ptr };
-                if key.equivalent(E::extract(slot_ref)) {
+                if likely(key.equivalent(E::extract(slot_ref))) {
                     return Some(val_ptr);
                 }
                 mask.remove_lowest_bit();
@@ -1072,7 +1111,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 let val_ptr = self.slot_mut(idx).cast::<E::Value>();
                 // SAFETY: val_ptr points to initialized Value (FULL slot).
                 let slot_ref = unsafe { &*val_ptr };
-                if key.equivalent(E::extract(slot_ref)) {
+                if likely(key.equivalent(E::extract(slot_ref))) {
                     // SAFETY: dropping initialized value in FULL slot, marking as DELETED.
                     unsafe {
                         if core::mem::needs_drop::<E::Value>() {
@@ -1114,10 +1153,10 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     /// otherwise inserts `value` and returns `&mut` to the new entry.
     #[inline]
     pub fn get_or_insert(&mut self, value: E::Value) -> &mut E::Value {
-        if unlikely(self.growth_left == 0) {
-            self.reserve_for_insert();
+        if unlikely(self.mask == 0) {
+            self.ensure_capacity();
+            return self.get_or_insert_inner(value);
         }
-
         self.get_or_insert_inner(value)
     }
 
@@ -1154,6 +1193,12 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 } else {
                     (pos + empty.lowest_set_bit()) & cap_mask
                 };
+
+                if unlikely(self.growth_left == 0) {
+                    self.grow();
+                    return self.insert_assume_unique_return(value);
+                }
+
                 let slot = self.slot_mut(idx);
                 // SAFETY: idx < cap (masked). Writing to empty/deleted slot.
                 unsafe {
@@ -1191,7 +1236,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             if core::mem::needs_drop::<E::Value>() {
                 let mut group_pos = 0;
                 while group_pos < cap {
-                    let mut full = Group::load(ctrl.add(group_pos)).match_full();
+                    let mut full = Group::load_aligned(ctrl.add(group_pos)).match_full();
                     while full.any() {
                         let bit = full.lowest_set_bit();
                         if core::mem::needs_drop::<E::Value>() {
@@ -1271,9 +1316,9 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     pub fn iter(&self) -> Iter<'_, E, S, A> {
         let ctrl = self.ctrl_ptr();
 
-        let bitmask = if self.mask > 0 {
+        let bitmask = if likely(self.mask > 0) {
             // SAFETY: mask > 0 so cap > 0, ctrl_ptr() points to valid ctrl array with cap + GROUP_WIDTH bytes.
-            unsafe { Group::load(ctrl) }.match_full()
+            unsafe { Group::load_aligned(ctrl) }.match_full()
         } else {
             BitMask(0)
         };
@@ -1307,11 +1352,10 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
     /// Double capacity and rehash all elements.
     /// O(n). Deleted slots are cleaned up during rehash.
-    #[cold]
     #[inline(never)]
     fn grow(&mut self) {
         debug_assert!(self.mask != 0);
-        let old_cap = self.capacity();
+        let old_cap = self.mask + 1;
         let new_cap = if old_cap == 0 {
             GROUP_WIDTH
         } else {
@@ -1339,7 +1383,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 let ocp = old_ctrl.as_ptr();
                 let mut group_pos = 0;
                 while group_pos < old_cap {
-                    let mut full = Group::load(ocp.add(group_pos)).match_full();
+                    let mut full = Group::load_aligned(ocp.add(group_pos)).match_full();
                     while full.any() {
                         let bit = full.lowest_set_bit();
 
@@ -1376,7 +1420,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> Drop for SwissTable<E, S, A> {
             if std::mem::needs_drop::<E::Value>() {
                 let mut group_pos = 0;
                 while group_pos < cap {
-                    let mut full = Group::load(ctrl.add(group_pos)).match_full();
+                    let mut full = Group::load_aligned(ctrl.add(group_pos)).match_full();
                     while full.any() {
                         let bit = full.lowest_set_bit();
                         ptr::drop_in_place(self.slot_mut(group_pos + bit).cast::<E::Value>());
@@ -1400,7 +1444,7 @@ pub struct Iter<'a, E: KeyExtract, S: BuildHasher = DefaultHashBuilder, A: Alloc
 impl<'a, E: KeyExtract, S: BuildHasher, A: Allocator> Iterator for Iter<'a, E, S, A> {
     type Item = &'a E::Value;
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         // SAFETY: group_pos < cap checked (returns None otherwise), bit < GROUP_WIDTH so
         // group_pos + bit < cap. Slot at idx is FULL (match_full bitmask). Group::load at
@@ -1419,7 +1463,7 @@ impl<'a, E: KeyExtract, S: BuildHasher, A: Allocator> Iterator for Iter<'a, E, S
                 if self.group_pos > self.table.mask {
                     return None;
                 }
-                let group = Group::load(ctrl.add(self.group_pos));
+                let group = Group::load_aligned(ctrl.add(self.group_pos));
                 self.bitmask = group.match_full();
             }
         }
