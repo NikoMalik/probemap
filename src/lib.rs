@@ -1017,8 +1017,11 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 } else {
                     (pos + empty.lowest_set_bit()) & cap_mask
                 };
+                // SAFETY: idx < cap (masked).
+                let was_empty =
+                    likely(insert_slot == usize::MAX) || unsafe { *ctrl.add(idx) } == ctrl::EMPTY;
 
-                if unlikely(self.growth_left == 0) {
+                if unlikely(was_empty && self.growth_left == 0) {
                     self.grow();
                     self.insert_assume_unique(value);
                     return;
@@ -1030,7 +1033,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                     ptr::write(self.slot_mut(idx), MaybeUninit::new(value));
                 }
                 self.len += 1;
-                self.growth_left -= 1;
+                self.growth_left -= was_empty as usize;
                 return;
             }
 
@@ -1225,8 +1228,11 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 } else {
                     (pos + empty.lowest_set_bit()) & cap_mask
                 };
+                // SAFETY: idx < cap (masked).
+                let was_empty =
+                    likely(insert_slot == usize::MAX) || unsafe { *ctrl.add(idx) } == ctrl::EMPTY;
 
-                if unlikely(self.growth_left == 0) {
+                if unlikely(was_empty && self.growth_left == 0) {
                     self.grow();
                     return self.insert_assume_unique_return(value);
                 }
@@ -1238,7 +1244,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                     ptr::write(slot, MaybeUninit::new(value));
                 }
                 self.len += 1;
-                self.growth_left -= 1;
+                self.growth_left -= was_empty as usize;
                 // SAFETY: just wrote value at idx, it is initialized.
                 return unsafe { &mut *slot.cast::<E::Value>() };
             }
@@ -1387,6 +1393,10 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     #[inline(never)]
     fn grow(&mut self) {
         debug_assert!(self.mask != 0);
+        if self.len <= bucket_mask_to_capacity(self.mask) / 2 {
+            self.rehash_in_place();
+            return;
+        }
         let old_cap = self.mask + 1;
         let new_cap = if old_cap == 0 {
             GROUP_WIDTH
@@ -1433,6 +1443,105 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 Self::dealloc_table(old_ctrl, old_cap, &self.alloc);
             }
         }
+    }
+
+    #[inline(always)]
+    fn find_insert_slot(&self, hash: u64) -> usize {
+        let ctrl = self.ctrl_ptr();
+        let mut pos = self.probe_start(hash);
+        loop {
+            // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes.
+            let m = unsafe { Group::load(ctrl.add(pos)) }.match_empty_or_deleted();
+            if likely(m.any()) {
+                return (pos + m.lowest_set_bit()) & self.mask;
+            }
+            pos = self.next_group(pos);
+        }
+    }
+
+    #[inline(always)]
+    fn is_in_same_group(&self, a: usize, b: usize, hash: u64) -> bool {
+        let start = self.probe_start(hash);
+        let ga = (a.wrapping_sub(start) & self.mask) / GROUP_WIDTH;
+        let gb = (b.wrapping_sub(start) & self.mask) / GROUP_WIDTH;
+        ga == gb
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn rehash_in_place(&mut self) {
+        let cap = self.mask + 1;
+        let size = std::mem::size_of::<E::Value>();
+        let guard = RehashGuard(self);
+        let table = &mut *guard.0;
+        let ctrl = table.ctrl_ptr();
+        let mask = table.mask;
+        // SAFETY: all indexes are < cap, ctrl has cap + GROUP_WIDTH bytes, slots marked
+        // DELETED below hold live values until moved or marked FULL.
+        unsafe {
+            for i in 0..cap {
+                let c = ctrl.add(i);
+                *c = if ctrl::is_full(*c) {
+                    ctrl::DELETED
+                } else {
+                    ctrl::EMPTY
+                };
+            }
+            ptr::copy_nonoverlapping(ctrl, ctrl.add(cap), GROUP_WIDTH);
+
+            let slots = table.slots_ptr();
+            'outer: for i in 0..cap {
+                if *ctrl.add(i) != ctrl::DELETED {
+                    continue;
+                }
+                let src = slots.add(i * size);
+                loop {
+                    let hash = table.make_hash(E::extract(&*src.cast::<E::Value>()));
+                    let h2 = ctrl::h2(hash);
+                    let new_i = table.find_insert_slot(hash);
+
+                    if likely(table.is_in_same_group(i, new_i, hash)) {
+                        set_ctrl(ctrl, mask, i, h2);
+                        continue 'outer;
+                    }
+
+                    let prev = *ctrl.add(new_i);
+                    set_ctrl(ctrl, mask, new_i, h2);
+                    let dst = slots.add(new_i * size);
+                    if prev == ctrl::EMPTY {
+                        set_ctrl(ctrl, mask, i, ctrl::EMPTY);
+                        ptr::copy_nonoverlapping(src, dst, size);
+                        continue 'outer;
+                    }
+                    debug_assert_eq!(prev, ctrl::DELETED);
+                    ptr::swap_nonoverlapping(src, dst, size);
+                }
+            }
+        }
+        table.growth_left = bucket_mask_to_capacity(mask) - table.len;
+    }
+}
+
+struct RehashGuard<'a, E: KeyExtract, S: BuildHasher, A: Allocator>(&'a mut SwissTable<E, S, A>);
+
+impl<E: KeyExtract, S: BuildHasher, A: Allocator> Drop for RehashGuard<'_, E, S, A> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let t = &mut *self.0;
+        let ctrl = t.ctrl_ptr();
+        for i in 0..=t.mask {
+            // SAFETY: i < cap, a DELETED slot during rehash still holds a live value.
+            unsafe {
+                if *ctrl.add(i) == ctrl::DELETED {
+                    set_ctrl(ctrl, t.mask, i, ctrl::EMPTY);
+                    ptr::drop_in_place(t.slot_mut(i).cast::<E::Value>());
+                    t.len -= 1;
+                }
+            }
+        }
+        t.growth_left = bucket_mask_to_capacity(t.mask) - t.len;
     }
 }
 
@@ -1900,5 +2009,84 @@ mod tests {
         let result = names.retrieve(&arg);
 
         assert_eq!(result, Some(&1));
+    }
+
+    #[test]
+    fn test_tombstone_churn_stays_bounded() {
+        let mut map = TestMap::with_capacity(16);
+        for round in 0..10_000u32 {
+            let k = round & 0xF;
+            map.insert(TestValue { key: k, data: "v" });
+            assert!(map.get(&k).is_some());
+            assert!(map.remove(&k));
+            assert!(map.get(&k).is_none());
+        }
+        assert_eq!(map.len(), 0);
+        assert!(map.capacity() <= 64, "capacity {}", map.capacity());
+    }
+
+    #[test]
+    fn test_rehash_in_place_matches_model() {
+        let mut map = SwissTable::<PairExtract<u32, String>>::new();
+        let mut model = std::collections::HashMap::new();
+        let mut x: u64 = 0xF00D_CAFE;
+        for op in 0..300_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % 4001) as u32;
+            if x % 100 < 60 {
+                assert_eq!(
+                    map.remove(&k),
+                    model.remove(&k).is_some(),
+                    "op {op} key {k}"
+                );
+            } else {
+                let v = format!("{k}-{op}");
+                map.insert((k, v.clone()));
+                model.insert(k, v);
+            }
+        }
+        assert_eq!(map.len(), model.len());
+        assert_eq!(map.iter().count(), model.len());
+        for (k, v) in &model {
+            assert_eq!(map.get(k).map(|(_, mv)| mv), Some(v), "key {k}");
+        }
+        assert!(map.capacity() <= 16384, "capacity {}", map.capacity());
+    }
+
+    #[test]
+    fn test_rehash_in_place_panic_in_hash() {
+        use std::cell::Cell;
+
+        thread_local!(static ARMED: Cell<bool> = const { Cell::new(false) });
+
+        #[derive(PartialEq, Eq)]
+        struct Bomb(u32, std::rc::Rc<()>);
+        impl std::hash::Hash for Bomb {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                if ARMED.with(Cell::get) && self.0 == 3 {
+                    panic!("hash bomb");
+                }
+                self.0.hash(state);
+            }
+        }
+
+        let rc = std::rc::Rc::new(());
+        let mut map = SwissTable::<PairExtract<Bomb, ()>>::with_capacity(64);
+        for i in 0..40 {
+            map.insert((Bomb(i, rc.clone()), ()));
+        }
+        ARMED.with(|a| a.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.rehash_in_place();
+        }));
+        ARMED.with(|a| a.set(false));
+        assert!(r.is_err());
+        assert!(map.len() < 40);
+        assert_eq!(map.iter().count(), map.len());
+        assert_eq!(std::rc::Rc::strong_count(&rc), map.len() + 1);
+        drop(map);
+        assert_eq!(std::rc::Rc::strong_count(&rc), 1);
     }
 }
