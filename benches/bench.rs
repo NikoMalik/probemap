@@ -61,7 +61,7 @@ fn serial_keys(n: usize) -> Vec<usize> {
 
 fn bench_insert(c: &mut Criterion) {
     let keys = random_keys(SIZE);
-    let mut g = c.benchmark_group("lookup");
+    let mut g = c.benchmark_group("insert");
 
     g.bench_function("probemap", |b| {
         let mut m = ProbeMap::with_capacity(SIZE);
