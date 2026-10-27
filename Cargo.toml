@@ -10,6 +10,7 @@ repository = "https://github.com/NikoMalik/probemap"
 
 
 [lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(probemap_generic)"] }
 missing_docs = "warn"
 unreachable_pub = "warn"
 unsafe_op_in_unsafe_fn = "warn"
