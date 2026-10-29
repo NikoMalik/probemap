@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="556" viewBox="0 0 760 556" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<style>
+.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e4e3df}.ref{stroke:#52514e}.s1{fill:#2a78d6}.s2{fill:#eb6834}.s3{fill:#1baf7a}.good{fill:#1f7a3a}.bad{fill:#b3261e}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#3a3936}.ref{stroke:#c3c2b7}.s1{fill:#3987e5}.s2{fill:#d95926}.s3{fill:#199e70}.good{fill:#5cc27a}.bad{fill:#f07a72}}
+</style>
+<rect width="100%" height="100%" rx="8" class="bg"/>
+<text x="16" y="28" font-size="16" font-weight="600" class="t1">probemap vs hashbrown 0.15, n=10000</text>
+<text x="16" y="47" font-size="12" class="t2">Time relative to the faster hashbrown setup (1.0), shorter is faster</text>
+<rect x="16" y="56" width="10" height="10" rx="2" class="s1"/><text x="31" y="65" font-size="12" class="t2">probemap</text>
+<rect x="103.8" y="56" width="10" height="10" rx="2" class="s2"/><text x="118.8" y="65" font-size="12" class="t2">hashbrown + fxhash</text>
+<rect x="257.6" y="56" width="10" height="10" rx="2" class="s3"/><text x="272.6" y="65" font-size="12" class="t2">hashbrown + foldhash</text>
+<line x1="150.0" y1="70" x2="150.0" y2="516" class="grid" stroke-width="1"/>
+<text x="150.0" y="532" font-size="11" text-anchor="middle" class="t2">0</text>
+<line x1="244.2" y1="70" x2="244.2" y2="516" class="grid" stroke-width="1"/>
+<text x="244.2" y="532" font-size="11" text-anchor="middle" class="t2">0.25</text>
+<line x1="338.5" y1="70" x2="338.5" y2="516" class="grid" stroke-width="1"/>
+<text x="338.5" y="532" font-size="11" text-anchor="middle" class="t2">0.5</text>
+<line x1="432.7" y1="70" x2="432.7" y2="516" class="grid" stroke-width="1"/>
+<text x="432.7" y="532" font-size="11" text-anchor="middle" class="t2">0.75</text>
+<line x1="526.9" y1="70" x2="526.9" y2="516" class="ref" stroke-dasharray="3 3" stroke-width="1"/>
+<text x="526.9" y="532" font-size="11" text-anchor="middle" class="t2">1</text>
+<line x1="621.2" y1="70" x2="621.2" y2="516" class="grid" stroke-width="1"/>
+<text x="621.2" y="532" font-size="11" text-anchor="middle" class="t2">1.25</text>
+<text x="700" y="64" font-size="11" text-anchor="middle" class="t2">vs best hb</text>
+<text x="140" y="89" font-size="12" text-anchor="end" class="t1">insert (random)</text>
+<rect x="150" y="77" width="314.1" height="7" rx="2" class="s1"><title>probemap: 53.0 µs (0.83x)</title></rect>
+<rect x="150" y="86" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 63.6 µs (1.00x)</title></rect>
+<rect x="150" y="95" width="393.5" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 66.4 µs (1.04x)</title></rect>
+<text x="700" y="89" font-size="12" font-weight="600" text-anchor="middle" class="good">-17%</text>
+<text x="140" y="123" font-size="12" text-anchor="end" class="t1">insert (serial)</text>
+<rect x="150" y="111" width="289.7" height="7" rx="2" class="s1"><title>probemap: 46.2 µs (0.77x)</title></rect>
+<rect x="150" y="120" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 60.1 µs (1.00x)</title></rect>
+<rect x="150" y="129" width="415.2" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 66.2 µs (1.10x)</title></rect>
+<text x="700" y="123" font-size="12" font-weight="600" text-anchor="middle" class="good">-23%</text>
+<text x="140" y="157" font-size="12" text-anchor="end" class="t1">grow_insert</text>
+<rect x="150" y="145" width="370.5" height="7" rx="2" class="s1"><title>probemap: 207.5 µs (0.98x)</title></rect>
+<rect x="150" y="154" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 211.1 µs (1.00x)</title></rect>
+<rect x="150" y="163" width="408.2" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 228.6 µs (1.08x)</title></rect>
+<text x="700" y="157" font-size="12" font-weight="600" text-anchor="middle" class="good">-2%</text>
+<text x="140" y="191" font-size="12" text-anchor="end" class="t1">lookup (random)</text>
+<rect x="150" y="179" width="243.5" height="7" rx="2" class="s1"><title>probemap: 30.3 µs (0.65x)</title></rect>
+<rect x="150" y="188" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 46.9 µs (1.00x)</title></rect>
+<rect x="150" y="197" width="383.4" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 47.7 µs (1.02x)</title></rect>
+<text x="700" y="191" font-size="12" font-weight="600" text-anchor="middle" class="good">-35%</text>
+<text x="140" y="225" font-size="12" text-anchor="end" class="t1">lookup (serial)</text>
+<rect x="150" y="213" width="244.0" height="7" rx="2" class="s1"><title>probemap: 29.0 µs (0.65x)</title></rect>
+<rect x="150" y="222" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 44.8 µs (1.00x)</title></rect>
+<rect x="150" y="231" width="403.0" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 47.9 µs (1.07x)</title></rect>
+<text x="700" y="225" font-size="12" font-weight="600" text-anchor="middle" class="good">-35%</text>
+<text x="140" y="259" font-size="12" text-anchor="end" class="t1">lookup_fail</text>
+<rect x="150" y="247" width="346.2" height="7" rx="2" class="s1"><title>probemap: 32.7 µs (0.92x)</title></rect>
+<rect x="150" y="256" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 35.6 µs (1.00x)</title></rect>
+<rect x="150" y="265" width="416.1" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 39.3 µs (1.10x)</title></rect>
+<text x="700" y="259" font-size="12" font-weight="600" text-anchor="middle" class="good">-8%</text>
+<text x="140" y="293" font-size="12" text-anchor="end" class="t1">insert_erase</text>
+<rect x="150" y="281" width="308.5" height="7" rx="2" class="s1"><title>probemap: 148.7 µs (0.82x)</title></rect>
+<rect x="150" y="290" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 181.7 µs (1.00x)</title></rect>
+<rect x="150" y="299" width="385.2" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 185.7 µs (1.02x)</title></rect>
+<text x="700" y="293" font-size="12" font-weight="600" text-anchor="middle" class="good">-18%</text>
+<text x="140" y="327" font-size="12" text-anchor="end" class="t1">iter</text>
+<rect x="150" y="315" width="288.9" height="7" rx="2" class="s1"><title>probemap: 8.2 µs (0.77x)</title></rect>
+<rect x="150" y="324" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 10.7 µs (1.00x)</title></rect>
+<rect x="150" y="333" width="376.9" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 10.7 µs (1.00x)</title></rect>
+<text x="700" y="327" font-size="12" font-weight="600" text-anchor="middle" class="good">-23%</text>
+<text x="140" y="361" font-size="12" text-anchor="end" class="t1">clone</text>
+<rect x="150" y="349" width="392.8" height="7" rx="2" class="s1"><title>probemap: 12.4 µs (1.04x)</title></rect>
+<rect x="150" y="358" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 11.9 µs (1.00x)</title></rect>
+<rect x="150" y="367" width="383.3" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 12.1 µs (1.02x)</title></rect>
+<text x="700" y="361" font-size="12" font-weight="600" text-anchor="middle" class="bad">+4%</text>
+<text x="140" y="395" font-size="12" text-anchor="end" class="t1">insert_bytes</text>
+<rect x="150" y="383" width="389.7" height="7" rx="2" class="s1"><title>probemap: 722.5 µs (1.03x)</title></rect>
+<rect x="150" y="392" width="377.0" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 699.1 µs (1.00x)</title></rect>
+<rect x="150" y="401" width="376.9" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 698.9 µs (1.00x)</title></rect>
+<text x="700" y="395" font-size="12" font-weight="600" text-anchor="middle" class="bad">+3%</text>
+<text x="140" y="429" font-size="12" text-anchor="end" class="t1">lookup_bytes</text>
+<rect x="150" y="417" width="327.9" height="7" rx="2" class="s1"><title>probemap: 116.5 µs (0.87x)</title></rect>
+<rect x="150" y="426" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 133.9 µs (1.00x)</title></rect>
+<rect x="150" y="435" width="377.2" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 134.0 µs (1.00x)</title></rect>
+<text x="700" y="429" font-size="12" font-weight="600" text-anchor="middle" class="good">-13%</text>
+<text x="140" y="463" font-size="12" text-anchor="end" class="t1">lookup_bytes_fail</text>
+<rect x="150" y="451" width="423.7" height="7" rx="2" class="s1"><title>probemap: 82.4 µs (1.12x)</title></rect>
+<rect x="150" y="460" width="458.7" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 89.2 µs (1.22x)</title></rect>
+<rect x="150" y="469" width="376.9" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 73.3 µs (1.00x)</title></rect>
+<text x="700" y="463" font-size="12" font-weight="600" text-anchor="middle" class="bad">+12%</text>
+<text x="140" y="497" font-size="12" text-anchor="end" class="t1">grow_insert_bytes</text>
+<rect x="150" y="485" width="382.7" height="7" rx="2" class="s1"><title>probemap: 877.3 µs (1.02x)</title></rect>
+<rect x="150" y="494" width="376.9" height="7" rx="2" class="s2"><title>hashbrown + fxhash: 864.0 µs (1.00x)</title></rect>
+<rect x="150" y="503" width="392.1" height="7" rx="2" class="s3"><title>hashbrown + foldhash: 898.8 µs (1.04x)</title></rect>
+<text x="700" y="497" font-size="12" font-weight="600" text-anchor="middle" class="bad">+2%</text>
+</svg>

@@ -122,6 +122,8 @@ Also implements `Extend`, `FromIterator`, `IntoIterator` (owned, `&`, `&mut`), `
 
 Median time for 10 000 operations, lower is better. The last column compares probemap with the faster of the two hashbrown setups.
 
+![benchmarks](docs/bench.svg)
+
 | Benchmark | probemap | hb+fxhash | hb+foldhash | vs best hashbrown |
 |---|---|---|---|---|
 | insert (random) | **53.0 µs** | 63.6 µs | 66.4 µs | **-17%** |
