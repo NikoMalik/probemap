@@ -465,7 +465,9 @@ unsafe fn fix_insert_slot_small(ctrl: *const u8, idx: usize) -> usize {
     // SAFETY: idx < cap and ctrl is a live table with cap + GROUP_WIDTH bytes (caller invariant).
     unsafe {
         if ctrl::is_full(*ctrl.add(idx)) {
-            Group::load_aligned(ctrl).match_empty_or_deleted().lowest_set_bit()
+            Group::load_aligned(ctrl)
+                .match_empty_or_deleted()
+                .lowest_set_bit()
         } else {
             idx
         }
@@ -736,9 +738,12 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     /// Free the combined ctrl + slots allocation.
     #[inline(always)]
     unsafe fn dealloc_table(ctrl: NonNull<u8>, cap: usize, alloc: &A) {
-        let (layout, _) = Self::table_layout(cap).expect("layout was valid when allocated");
-        // SAFETY: layout matches the one used in alloc_table, ctrl was allocated by this allocator.
-        unsafe { alloc.deallocate(ctrl, layout) };
+        // SAFETY: alloc_table already computed this layout for the same cap, so it is Some,
+        // ctrl was allocated by this allocator with exactly this layout.
+        unsafe {
+            let (layout, _) = Self::table_layout(cap).unwrap_unchecked();
+            alloc.deallocate(ctrl, layout);
+        }
     }
 
     /// Initial probe position from lower bits of hash.
@@ -787,17 +792,17 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     pub fn insert(&mut self, value: E::Value) {
         if unlikely(self.mask == 0) {
             self.ensure_capacity();
-            self.insert_inner(value);
+            self.insert_inner::<false>(value);
             return;
         }
-        self.insert_inner(value);
+        self.insert_inner::<false>(value);
     }
 
     pub fn replace(&mut self, value: E::Value) -> Option<E::Value> {
         if unlikely(self.mask == 0) {
             self.ensure_capacity();
         }
-        self.insert_inner(value)
+        self.insert_inner::<true>(value)
     }
 
     /// Fast insert for rehash — no duplicate check, no deleted slots.
@@ -835,7 +840,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
     // /// Inner insert with duplicate check.
     #[inline]
-    fn insert_inner(&mut self, value: E::Value) -> Option<E::Value> {
+    fn insert_inner<const RETURN_OLD: bool>(&mut self, value: E::Value) -> Option<E::Value> {
         let key = E::extract(&value);
         let hash = self.make_hash(key);
         let h2 = ctrl::h2(hash);
@@ -865,8 +870,16 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 // SAFETY: val_ptr points to initialized Value (slot is FULL, confirmed by h2 match).
                 let slot_ref = unsafe { &*val_ptr };
                 if unlikely(E::extract(slot_ref) == key) {
-                    // SAFETY: idx is a valid FULL slot, the old value is moved out to the caller.
-                    return Some(unsafe { ptr::replace(val_ptr, value) });
+                    // SAFETY: idx is a valid FULL slot, the old value is either moved out to the
+                    // caller or dropped in place before the new one is written.
+                    unsafe {
+                        if RETURN_OLD {
+                            return Some(ptr::replace(val_ptr, value));
+                        }
+                        ptr::drop_in_place(val_ptr);
+                        ptr::write(val_ptr, value);
+                    }
+                    return None;
                 }
                 mask.remove_lowest_bit();
             }
@@ -2594,5 +2607,24 @@ mod tests {
                 assert!(map.capacity() <= MIN_BUCKETS, "capacity {}", map.capacity());
             }
         }
+    }
+
+    #[test]
+    fn test_insert_overwrite_drops_old_once() {
+        let rc = std::rc::Rc::new(());
+        let mut map = SwissTable::<PairExtract<u32, std::rc::Rc<()>>>::new();
+        for i in 0..100 {
+            map.insert((i, rc.clone()));
+        }
+        for i in 0..100 {
+            map.insert((i, rc.clone()));
+        }
+        assert_eq!(std::rc::Rc::strong_count(&rc), 101);
+        let old = map.replace((7, rc.clone()));
+        assert!(old.is_some());
+        assert_eq!(std::rc::Rc::strong_count(&rc), 102);
+        drop(old);
+        drop(map);
+        assert_eq!(std::rc::Rc::strong_count(&rc), 1);
     }
 }
