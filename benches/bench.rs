@@ -8,8 +8,9 @@
 //! Run: `cargo bench`
 //! HTML report: target/criterion/report/index.html
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use hashbrown::HashMap as HbMap;
 
@@ -432,12 +433,16 @@ fn bench_clone(c: &mut Criterion) {
 
 // ---------------------------------------------------------------------------
 // Byte-key benchmarks — exercises Hasher::write(bytes) path
-// probemap: AutoHasher -> buthash::low_level_hash
-// hb_fxhash: FxHasher -> rotate-xor-multiply per 8-byte chunk
+// probemap: AutoHasher -> fx_bytes, rotate-xor-multiply per 8-byte chunk
+// probemap_fx and hb_fxhash: the same FxBuildHasher, so only the tables differ
 // hb_foldhash: foldhash default
+// insert_bytes reuses one warm table, clears it and clones the keys outside the timing,
+// so malloc, free and page faults of fresh memory are not measured
+// grow_insert_bytes builds a new table inside the timing on purpose, growth is what it measures
 // ---------------------------------------------------------------------------
 
 type ProbeByteMap = SwissTable<PairExtract<Vec<u8>, usize>>;
+type ProbeFxByteMap = SwissTable<PairExtract<Vec<u8>, usize>, FxBuildHasher>;
 type HbFxByteMap = HbMap<Vec<u8>, usize, FxBuildHasher>;
 type HbFoldByteMap = HbMap<Vec<u8>, usize>;
 
@@ -460,41 +465,82 @@ fn random_byte_keys(n: usize, skip: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn insert_moved_keys<M>(
+    b: &mut criterion::Bencher<'_>,
+    keys: &[Vec<u8>],
+    mut m: M,
+    clear: impl Fn(&mut M),
+    insert: impl Fn(&mut M, Vec<u8>, usize),
+) {
+    let mut ks: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+    b.iter_custom(|iters| {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            clear(&mut m);
+            ks.extend(keys.iter().cloned());
+            let start = Instant::now();
+            for (i, k) in ks.drain(..).enumerate() {
+                insert(&mut m, k, i);
+            }
+            total += start.elapsed();
+            black_box(&mut m);
+        }
+        total
+    });
+}
+
 fn bench_insert_bytes(c: &mut Criterion) {
     let keys = random_byte_keys(SIZE, 0);
     let mut g = c.benchmark_group("insert_bytes");
 
     g.bench_function("probemap", |b| {
-        let mut m = ProbeByteMap::with_capacity(SIZE);
-        b.iter(|| {
-            m.clear();
-            for (i, k) in keys.iter().enumerate() {
-                m.insert((k.clone(), i));
-            }
-            black_box(&mut m);
-        });
+        insert_moved_keys(
+            b,
+            &keys,
+            ProbeByteMap::with_capacity(SIZE),
+            |m| m.clear(),
+            |m, k, i| {
+                m.insert((k, i));
+            },
+        );
+    });
+
+    g.bench_function("probemap_fx", |b| {
+        let m = ProbeFxByteMap::with_capacity_and_hasher(SIZE, FxBuildHasher);
+        insert_moved_keys(
+            b,
+            &keys,
+            m,
+            |m| m.clear(),
+            |m, k, i| {
+                m.insert((k, i));
+            },
+        );
     });
 
     g.bench_function("hb_fxhash", |b| {
-        let mut m = HbFxByteMap::with_capacity_and_hasher(SIZE, FxBuildHasher);
-        b.iter(|| {
-            m.clear();
-            for (i, k) in keys.iter().enumerate() {
-                m.insert(k.clone(), i);
-            }
-            black_box(&mut m);
-        });
+        let m = HbFxByteMap::with_capacity_and_hasher(SIZE, FxBuildHasher);
+        insert_moved_keys(
+            b,
+            &keys,
+            m,
+            |m| m.clear(),
+            |m, k, i| {
+                m.insert(k, i);
+            },
+        );
     });
 
     g.bench_function("hb_foldhash", |b| {
-        let mut m = HbFoldByteMap::with_capacity(SIZE);
-        b.iter(|| {
-            m.clear();
-            for (i, k) in keys.iter().enumerate() {
-                m.insert(k.clone(), i);
-            }
-            black_box(&mut m);
-        });
+        insert_moved_keys(
+            b,
+            &keys,
+            HbFoldByteMap::with_capacity(SIZE),
+            |m| m.clear(),
+            |m, k, i| {
+                m.insert(k, i);
+            },
+        );
     });
 
     g.finish();
@@ -504,10 +550,12 @@ fn bench_lookup_bytes(c: &mut Criterion) {
     let keys = random_byte_keys(SIZE, 0);
 
     let mut probe = ProbeByteMap::with_capacity(SIZE);
+    let mut probe_fx = ProbeFxByteMap::with_capacity_and_hasher(SIZE, FxBuildHasher);
     let mut hb_fx = HbFxByteMap::with_capacity_and_hasher(SIZE, FxBuildHasher);
     let mut hb_fold = HbFoldByteMap::with_capacity(SIZE);
     for (i, k) in keys.iter().enumerate() {
         probe.insert((k.clone(), i));
+        probe_fx.insert((k.clone(), i));
         hb_fx.insert(k.clone(), i);
         hb_fold.insert(k.clone(), i);
     }
@@ -518,6 +566,14 @@ fn bench_lookup_bytes(c: &mut Criterion) {
         b.iter(|| {
             for k in &keys {
                 black_box(probe.get(k));
+            }
+        });
+    });
+
+    g.bench_function("probemap_fx", |b| {
+        b.iter(|| {
+            for k in &keys {
+                black_box(probe_fx.get(k));
             }
         });
     });
@@ -546,10 +602,12 @@ fn bench_lookup_bytes_fail(c: &mut Criterion) {
     let miss_keys = random_byte_keys(SIZE, SIZE); // skip past inserted keys
 
     let mut probe = ProbeByteMap::with_capacity(SIZE);
+    let mut probe_fx = ProbeFxByteMap::with_capacity_and_hasher(SIZE, FxBuildHasher);
     let mut hb_fx = HbFxByteMap::with_capacity_and_hasher(SIZE, FxBuildHasher);
     let mut hb_fold = HbFoldByteMap::with_capacity(SIZE);
     for (i, k) in keys.iter().enumerate() {
         probe.insert((k.clone(), i));
+        probe_fx.insert((k.clone(), i));
         hb_fx.insert(k.clone(), i);
         hb_fold.insert(k.clone(), i);
     }
@@ -560,6 +618,14 @@ fn bench_lookup_bytes_fail(c: &mut Criterion) {
         b.iter(|| {
             for k in &miss_keys {
                 black_box(probe.get(k));
+            }
+        });
+    });
+
+    g.bench_function("probemap_fx", |b| {
+        b.iter(|| {
+            for k in &miss_keys {
+                black_box(probe_fx.get(k));
             }
         });
     });
@@ -588,33 +654,59 @@ fn bench_grow_insert_bytes(c: &mut Criterion) {
     let mut g = c.benchmark_group("grow_insert_bytes");
 
     g.bench_function("probemap", |b| {
-        b.iter(|| {
-            let mut m = ProbeByteMap::new();
-            for (i, k) in keys.iter().enumerate() {
-                m.insert((k.clone(), i));
-            }
-            black_box(&mut m);
-        });
+        b.iter_batched(
+            || keys.clone(),
+            |ks| {
+                let mut m = ProbeByteMap::new();
+                for (i, k) in ks.into_iter().enumerate() {
+                    m.insert((k, i));
+                }
+                m
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    g.bench_function("probemap_fx", |b| {
+        b.iter_batched(
+            || keys.clone(),
+            |ks| {
+                let mut m = ProbeFxByteMap::with_hasher(FxBuildHasher);
+                for (i, k) in ks.into_iter().enumerate() {
+                    m.insert((k, i));
+                }
+                m
+            },
+            BatchSize::LargeInput,
+        );
     });
 
     g.bench_function("hb_fxhash", |b| {
-        b.iter(|| {
-            let mut m = HbFxByteMap::with_hasher(FxBuildHasher);
-            for (i, k) in keys.iter().enumerate() {
-                m.insert(k.clone(), i);
-            }
-            black_box(&mut m);
-        });
+        b.iter_batched(
+            || keys.clone(),
+            |ks| {
+                let mut m = HbFxByteMap::with_hasher(FxBuildHasher);
+                for (i, k) in ks.into_iter().enumerate() {
+                    m.insert(k, i);
+                }
+                m
+            },
+            BatchSize::LargeInput,
+        );
     });
 
     g.bench_function("hb_foldhash", |b| {
-        b.iter(|| {
-            let mut m = HbFoldByteMap::new();
-            for (i, k) in keys.iter().enumerate() {
-                m.insert(k.clone(), i);
-            }
-            black_box(&mut m);
-        });
+        b.iter_batched(
+            || keys.clone(),
+            |ks| {
+                let mut m = HbFoldByteMap::new();
+                for (i, k) in ks.into_iter().enumerate() {
+                    m.insert(k, i);
+                }
+                m
+            },
+            BatchSize::LargeInput,
+        );
     });
 
     g.finish();

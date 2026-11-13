@@ -115,6 +115,55 @@ impl FxHasher {
     }
 }
 
+#[inline(always)]
+fn fx_step(hash: u64, word: u64) -> u64 {
+    (hash.rotate_left(5) ^ word).wrapping_mul(SEED)
+}
+
+#[inline(always)]
+fn read_u64(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+}
+
+#[inline(always)]
+fn read_u32(bytes: &[u8], at: usize) -> u64 {
+    u64::from(u32::from_le_bytes(
+        bytes[at..at + 4].try_into().expect("4 bytes"),
+    ))
+}
+
+#[inline]
+fn fx_write(hash: u64, bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    let tag = (len as u64).rotate_right(8);
+    match len {
+        0 => hash,
+        1..=3 => {
+            let word = u64::from(bytes[0])
+                | (u64::from(bytes[len / 2]) << 8)
+                | (u64::from(bytes[len - 1]) << 16);
+            fx_step(hash, word ^ tag)
+        }
+        4..=7 => fx_step(
+            hash,
+            (read_u32(bytes, 0) | (read_u32(bytes, len - 4) << 32)) ^ tag,
+        ),
+        8..=16 => fx_step(
+            fx_step(hash, read_u64(bytes, 0) ^ tag),
+            read_u64(bytes, len - 8),
+        ),
+        _ => {
+            let mut h = fx_step(hash, tag);
+            let mut at = 0;
+            while at + 8 < len {
+                h = fx_step(h, read_u64(bytes, at));
+                at += 8;
+            }
+            fx_step(h, read_u64(bytes, len - 8))
+        }
+    }
+}
+
 impl std::hash::Hasher for FxHasher {
     #[inline]
     fn finish(&self) -> u64 {
@@ -123,17 +172,7 @@ impl std::hash::Hasher for FxHasher {
 
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in chunks.by_ref() {
-            let word = u64::from_ne_bytes(chunk.try_into().unwrap());
-            self.add_to_hash(word);
-        }
-        let remainder = chunks.remainder();
-        if !remainder.is_empty() {
-            let mut buf = [0u8; 8];
-            buf[..remainder.len()].copy_from_slice(remainder);
-            self.add_to_hash(u64::from_ne_bytes(buf));
-        }
+        self.hash = fx_write(self.hash, bytes);
     }
 
     #[inline]
@@ -199,17 +238,7 @@ impl AutoHasher {
 
     #[inline]
     fn fx_bytes(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in chunks.by_ref() {
-            let word = u64::from_ne_bytes(chunk.try_into().unwrap());
-            self.fx_mix(word);
-        }
-        let remainder = chunks.remainder();
-        if !remainder.is_empty() {
-            let mut buf = [0u8; 8];
-            buf[..remainder.len()].copy_from_slice(remainder);
-            self.fx_mix(u64::from_ne_bytes(buf));
-        }
+        self.hash = fx_write(self.hash, bytes);
     }
 }
 
@@ -450,6 +479,12 @@ fn capacity_to_buckets(items: usize) -> Option<usize> {
 
 const MIN_BUCKETS: usize = 8;
 
+#[inline(never)]
+unsafe fn replace_and_drop<T>(slot: *mut T, value: T) {
+    // SAFETY: slot holds a live T (caller invariant), the old value is moved out before it drops.
+    drop(unsafe { ptr::replace(slot, value) });
+}
+
 #[inline(always)]
 unsafe fn fix_insert_slot(ctrl: *const u8, mask: usize, idx: usize) -> usize {
     if unlikely(mask < GROUP_WIDTH - 1) {
@@ -459,8 +494,7 @@ unsafe fn fix_insert_slot(ctrl: *const u8, mask: usize, idx: usize) -> usize {
     idx
 }
 
-#[cold]
-#[inline(never)]
+#[inline(always)]
 unsafe fn fix_insert_slot_small(ctrl: *const u8, idx: usize) -> usize {
     // SAFETY: idx < cap and ctrl is a live table with cap + GROUP_WIDTH bytes (caller invariant).
     unsafe {
@@ -870,14 +904,17 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 // SAFETY: val_ptr points to initialized Value (slot is FULL, confirmed by h2 match).
                 let slot_ref = unsafe { &*val_ptr };
                 if unlikely(E::extract(slot_ref) == key) {
-                    // SAFETY: idx is a valid FULL slot, the old value is either moved out to the
-                    // caller or dropped in place before the new one is written.
+                    // SAFETY: idx is a valid FULL slot, the new value is put in before the old
+                    // one is dropped, so a panicking Drop leaves the table consistent.
                     unsafe {
                         if RETURN_OLD {
                             return Some(ptr::replace(val_ptr, value));
                         }
-                        ptr::drop_in_place(val_ptr);
-                        ptr::write(val_ptr, value);
+                        if core::mem::needs_drop::<E::Value>() {
+                            replace_and_drop(val_ptr, value);
+                        } else {
+                            ptr::write(val_ptr, value);
+                        }
                     }
                     return None;
                 }
@@ -1015,13 +1052,9 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let Some(idx) = self.find_hashed(self.hash_builder.hash_one(key), key) else {
             return false;
         };
-        // SAFETY: find_hashed returned a FULL slot.
-        unsafe {
-            if core::mem::needs_drop::<E::Value>() {
-                ptr::drop_in_place(self.slot_mut(idx).cast::<E::Value>());
-            }
-            self.erase_no_drop(idx);
-        }
+        // SAFETY: find_hashed returned a FULL slot, take_at marks it DELETED before the
+        // value drops, so a panicking Drop leaves the table consistent.
+        drop(unsafe { self.take_at(idx) });
         true
     }
 
@@ -1287,30 +1320,22 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         if unlikely(self.mask == 0) {
             return;
         }
-        let ctrl = self.ctrl_ptr();
-
-        let cap = self.mask + 1;
-        // SAFETY: mask > 0 so cap > 0, dropping FULL slots via SIMD group scan, then resetting ctrl.
-        unsafe {
-            if core::mem::needs_drop::<E::Value>() {
-                let mut group_pos = 0;
-                while group_pos < cap {
-                    let mut full = Group::load_aligned(ctrl.add(group_pos)).match_full();
-                    while full.any() {
-                        let bit = full.lowest_set_bit();
-                        if core::mem::needs_drop::<E::Value>() {
-                            ptr::drop_in_place(self.slot_mut(group_pos + bit).cast::<E::Value>());
-                        }
-
-                        full.remove_lowest_bit();
-                    }
-                    group_pos += GROUP_WIDTH;
-                }
+        let guard = ClearGuard(self);
+        if core::mem::needs_drop::<E::Value>() {
+            let t: &Self = guard.0;
+            let mut raw = RawIter::new(
+                t.ctrl_ptr(),
+                t.slots_ptr().cast::<E::Value>(),
+                t.mask,
+                t.len,
+            );
+            // SAFETY: RawIter yields each FULL slot once, ctrl is only reset by the guard after
+            // the loop, also when a Drop panics, so no value is dropped twice.
+            while let Some((_, p)) = unsafe { raw.next() } {
+                // SAFETY: p points to a live value in a FULL slot that is dropped only here.
+                unsafe { ptr::drop_in_place(p) };
             }
-            ptr::write_bytes(ctrl, ctrl::EMPTY, cap + GROUP_WIDTH);
         }
-        self.len = 0;
-        self.growth_left = bucket_mask_to_capacity(self.mask);
     }
 
     /// Deep-copy the table.
@@ -1563,6 +1588,18 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             }
         }
         table.growth_left = bucket_mask_to_capacity(mask) - table.len;
+    }
+}
+
+struct ClearGuard<'a, E: KeyExtract, S: BuildHasher, A: Allocator>(&'a mut SwissTable<E, S, A>);
+
+impl<E: KeyExtract, S: BuildHasher, A: Allocator> Drop for ClearGuard<'_, E, S, A> {
+    fn drop(&mut self) {
+        let t = &mut *self.0;
+        // SAFETY: mask > 0 (checked by clear), ctrl has cap + GROUP_WIDTH bytes.
+        unsafe { ptr::write_bytes(t.ctrl_ptr(), ctrl::EMPTY, t.mask + 1 + GROUP_WIDTH) };
+        t.len = 0;
+        t.growth_left = bucket_mask_to_capacity(t.mask);
     }
 }
 
@@ -2626,5 +2663,132 @@ mod tests {
         drop(old);
         drop(map);
         assert_eq!(std::rc::Rc::strong_count(&rc), 1);
+    }
+
+    #[test]
+    fn test_insert_overwrite_panicking_drop_keeps_table_sound() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Noisy {
+            drops: Rc<Cell<u32>>,
+            panic_on_drop: bool,
+        }
+        impl Drop for Noisy {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+                if self.panic_on_drop {
+                    panic!("drop bomb");
+                }
+            }
+        }
+
+        let drops = Rc::new(Cell::new(0));
+        let mut map = SwissTable::<PairExtract<u32, Noisy>>::new();
+        map.insert((
+            1,
+            Noisy {
+                drops: drops.clone(),
+                panic_on_drop: true,
+            },
+        ));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.insert((
+                1,
+                Noisy {
+                    drops: drops.clone(),
+                    panic_on_drop: false,
+                },
+            ));
+        }));
+        assert!(r.is_err());
+        assert_eq!(drops.get(), 1);
+        assert_eq!(map.len(), 1);
+        assert!(!map.get(&1).expect("new value is in place").1.panic_on_drop);
+        drop(map);
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn test_remove_and_clear_with_panicking_drop_keep_table_sound() {
+        use std::cell::Cell;
+
+        thread_local!(static DROPS: Cell<u32> = const { Cell::new(0) });
+        let drops = || DROPS.with(Cell::get);
+
+        struct Noisy(bool);
+        impl Drop for Noisy {
+            fn drop(&mut self) {
+                DROPS.with(|d| d.set(d.get() + 1));
+                if self.0 {
+                    panic!("drop bomb");
+                }
+            }
+        }
+
+        let mut map = SwissTable::<PairExtract<u32, Noisy>>::new();
+        map.insert((1, Noisy(true)));
+        map.insert((2, Noisy(false)));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.remove(&1)));
+        assert!(r.is_err());
+        assert_eq!(drops(), 1);
+        assert_eq!(map.len(), 1);
+        assert!(map.get(&1).is_none());
+        drop(map);
+        assert_eq!(drops(), 2);
+
+        DROPS.with(|d| d.set(0));
+        let mut map = SwissTable::<PairExtract<u32, Noisy>>::new();
+        for i in 0..6 {
+            map.insert((i, Noisy(i == 3)));
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.clear()));
+        assert!(r.is_err());
+        let after_clear = drops();
+        assert!((1..=6).contains(&after_clear), "dropped {after_clear}");
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.iter().count(), 0);
+        map.insert((9, Noisy(false)));
+        drop(map);
+        assert_eq!(drops(), after_clear + 1);
+    }
+
+    #[test]
+    fn test_byte_hash_sees_every_byte_and_length() {
+        use std::hash::Hasher;
+        let hash = |b: &[u8]| {
+            let mut fx = FxHasher::with_seed(SEED);
+            fx.write(b);
+            let mut auto = AutoHasher::with_seed(SEED);
+            auto.write(b);
+            assert_eq!(fx.finish(), auto.finish(), "Fx and Auto disagree on {b:?}");
+            fx.finish()
+        };
+        let mut seen = std::collections::HashSet::new();
+        for len in 0..=40usize {
+            let base: Vec<u8> = (0..len as u8)
+                .map(|i| i.wrapping_mul(37).wrapping_add(11))
+                .collect();
+            assert!(
+                seen.insert(hash(&base)),
+                "length {len} collides with a shorter key"
+            );
+            for at in 0..len {
+                let mut flipped = base.clone();
+                flipped[at] ^= 0x5A;
+                assert_ne!(
+                    hash(&base),
+                    hash(&flipped),
+                    "len {len}: byte {at} is ignored"
+                );
+            }
+        }
+        let zeros: Vec<u64> = (0..=24).map(|n| hash(&vec![0u8; n])).collect();
+        let unique: std::collections::HashSet<_> = zeros.iter().collect();
+        assert_eq!(
+            unique.len(),
+            zeros.len(),
+            "zero keys of different length collide"
+        );
     }
 }
