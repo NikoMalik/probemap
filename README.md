@@ -7,14 +7,14 @@ A SwissTable hash map with direct SIMD — works on **stable Rust**.
 - **Drop-in `HashMap` / `HashSet`** with the `std` API, including the entry API
 - **SIMD on every major target**: SSE2 on x86_64, NEON on aarch64, SWAR (8 bytes as one `u64`) everywhere else
 - **`KeyExtract` trait** — store only values when the key is embedded in the value
-- **Pluggable `BuildHasher`** — default `AutoHasher` (FxHash for ints, buthash for byte slices), swap for any hasher
+- **Pluggable `BuildHasher`** — default `AutoHasher` (FxHash for integers, an FxHash variant for byte slices that reads keys of 8 to 16 bytes with two loads), swap for any hasher
 - **Custom allocator support** via `allocator-api2` (stable polyfill for the Allocator API)
 - **`Send` / `Sync`** like `std` collections
 - **Zero-cost empty table** — `new()` does not allocate, the first insert allocates 8 slots
 - **Tombstone cleanup without growing** — delete-heavy workloads rehash in place instead of doubling
 - **`reserve` / `try_reserve` / `shrink_to_fit`**, `with_capacity(n)` really holds `n` items
 - **Bulk `memcpy` clone** for `Copy` types
-- **87% load factor** with linear group probing
+- **87% load factor** with triangular group probing (`--cfg probemap_linear` switches to linear)
 
 ## Drop-in replacement for `std`
 
@@ -82,7 +82,7 @@ assert_eq!(users.get(&1).unwrap().name, "Alice");
 use probemap::{SwissTable, PairExtract, FxBuildHasher};
 use std::collections::hash_map::RandomState;
 
-// Use FxHash only (no buthash)
+// Use FxHasher directly
 let map = SwissTable::<PairExtract<u64, u64>, FxBuildHasher>::with_hasher(FxBuildHasher);
 
 // Use SipHash (DoS-resistant)
@@ -126,23 +126,57 @@ Median time for 10 000 operations, lower is better. The last column compares pro
 
 | Benchmark | probemap | hb+fxhash | hb+foldhash | vs best hashbrown |
 |---|---|---|---|---|
-| insert (random) | **53.0 µs** | 63.6 µs | 66.4 µs | **-17%** |
-| insert (serial) | **46.2 µs** | 60.1 µs | 66.2 µs | **-23%** |
-| grow_insert | **207.5 µs** | 211.1 µs | 228.6 µs | **-2%** |
-| lookup (random) | **30.3 µs** | 46.9 µs | 47.7 µs | **-35%** |
-| lookup (serial) | **29.0 µs** | 44.8 µs | 47.9 µs | **-35%** |
-| lookup_fail | **32.7 µs** | 35.6 µs | 39.3 µs | **-8%** |
-| insert_erase | **148.7 µs** | 181.7 µs | 185.7 µs | **-18%** |
-| iter | **8.2 µs** | 10.7 µs | 10.7 µs | **-23%** |
-| clone | 12.4 µs | 11.9 µs | 12.1 µs | +4% |
-| insert_bytes | 722.5 µs | 699.1 µs | 698.9 µs | +3% |
-| lookup_bytes | **116.5 µs** | 133.9 µs | 134.0 µs | **-13%** |
-| lookup_bytes_fail | 82.4 µs | 89.2 µs | 73.3 µs | +12% |
-| grow_insert_bytes | 877.3 µs | 864.0 µs | 898.8 µs | +2% |
+| insert (random) | **58.2 µs** | 64.2 µs | 67.2 µs | **-9%** |
+| insert (serial) | **46.1 µs** | 58.5 µs | 63.9 µs | **-21%** |
+| grow_insert | **196.6 µs** | 212.3 µs | 225.9 µs | **-7%** |
+| lookup (random) | **30.9 µs** | 47.7 µs | 47.9 µs | **-35%** |
+| lookup (serial) | **29.4 µs** | 45.9 µs | 47.7 µs | **-36%** |
+| lookup_fail | **32.5 µs** | 36.0 µs | 39.1 µs | **-10%** |
+| insert_erase | **133.5 µs** | 179.5 µs | 185.2 µs | **-26%** |
+| iter | **8.1 µs** | 12.3 µs | 12.0 µs | **-32%** |
+| clone | 12.3 µs | 11.4 µs | 11.4 µs | +8% |
+| insert_bytes | 167.4 µs | 154.0 µs | 151.6 µs | +10% |
+| lookup_bytes | **104.4 µs** | 110.2 µs | 122.8 µs | **-5%** |
+| lookup_bytes_fail | **64.1 µs** | 66.0 µs | 71.5 µs | **-3%** |
+| grow_insert_bytes | 308.9 µs | 299.5 µs | 380.4 µs | +3% |
 
 Setup: Intel Core i5-11400F, Linux, `target-cpu=native` (from `.cargo/config.toml`), criterion 0.5, `cargo bench --bench bench`.
-`*_bytes` benchmarks use byte-string keys, the rest use random or serial `usize` keys.
+`*_bytes` benchmarks use 16-byte `Vec<u8>` keys, the rest use random or serial `usize` keys. `insert_bytes` reuses one warm table, clears it and clones the keys outside the timing, so it measures the table and not `malloc`. probemap uses its default hasher, with the same `FxBuildHasher` as `hb+fxhash` the byte results are: insert_bytes +9%, lookup_bytes -5%, lookup_bytes_fail -4%, grow_insert_bytes +3% (the `probemap_fx` rows in the bench).
 All tables fit in CPU cache at this size, results for tables much larger than cache may differ.
+Single runs move by a few percent depending on where the linker puts the hot loops, compare with that in mind.
+
+### Linear vs triangular probing
+
+probemap probes groups triangularly, the step grows by one group every time (`+16`, `+32`, `+48` …), like hashbrown.
+Linear probing (`+16` every time) reads the neighbouring group, which is kinder to the cache, but when many keys
+start at the same place the runs of full groups merge and every lookup walks the whole run.
+`benches/probing.rs` forces that: 14 000 keys in a table 85% full, N keys share each start position.
+
+![probing](docs/probing.svg)
+
+| keys per start | operation | triangular | linear | linear vs triangular | hashbrown |
+|---|---|---|---|---|---|
+| 1 | insert | 121.2 µs | 120.9 µs | 0% | 141.6 µs |
+| 1 | lookup hit | 90.2 µs | 93.1 µs | +3% | 123.0 µs |
+| 1 | lookup miss | 302.4 µs | 340.2 µs | +13% | 349.2 µs |
+| 8 | insert | 256.0 µs | 281.3 µs | +10% | 244.4 µs |
+| 8 | lookup hit | 175.6 µs | 267.4 µs | +52% | 214.6 µs |
+| 8 | lookup miss | 531.7 µs | 752.9 µs | +42% | 533.2 µs |
+| 32 | insert | 421.7 µs | 683.3 µs | +62% | 382.6 µs |
+| 32 | lookup hit | 373.2 µs | 662.7 µs | +78% | 409.0 µs |
+| 32 | lookup miss | 780.8 µs | 3337.9 µs | +327% | 762.4 µs |
+| 128 | insert | 725.5 µs | 1173.1 µs | +62% | 612.3 µs |
+| 128 | lookup hit | 670.1 µs | 1121.8 µs | +67% | 716.3 µs |
+| 128 | lookup miss | 1218.5 µs | 3970.0 µs | +226% | 1267.0 µs |
+
+With a good hash and no clusters both are within a few percent. With clusters linear probing is up to 4x slower.
+The same effect made copying one table into another by iteration slow with linear probing: 100 000 keys took
+28 ms instead of 5.4 ms (hashbrown 5.1 ms). Rerun it with:
+
+```sh
+cargo bench --bench probing
+RUSTFLAGS="-C target-cpu=native --cfg probemap_linear" CARGO_TARGET_DIR=target-linear cargo bench --bench probing
+```
 
 ## Why faster than hashbrown?
 
@@ -172,12 +206,12 @@ hashbrown has four layers: `HashMap` -> `HashTable` -> `RawTable` ->
 `Bucket<T>` through pointer arithmetic. probemap is a single struct with inline
 methods — no type erasure, no `Bucket` wrapper, no intermediate layers.
 
-**Linear group probing.**
-hashbrown uses triangular probing (`stride += 16; pos += stride`) — two
-additions and an extra field per step. probemap uses linear probing with
-mirrored control bytes: `pos = (pos + 16) & mask` — one add, one and. The
-mirror (first 16 control bytes duplicated at the end of the array) lets
-unaligned SIMD loads wrap around without sentinel bytes or branches.
+**Mirrored control bytes.**
+The first 16 control bytes are duplicated at the end of the array, so an
+unaligned SIMD load near the end wraps around without sentinel bytes or
+branches. Probing is triangular (`stride += 16; pos += stride`), the extra add
+per step costs nothing measurable and keeps colliding keys from merging into
+long runs, see [Linear vs triangular probing](#linear-vs-triangular-probing).
 
 **Cheap growth.**
 A freshly allocated table has no tombstones, so the move loop finds a free slot
@@ -203,7 +237,6 @@ the entire slots array is a single `memcpy` — no per-element loop, no rehash.
 
 ## Caveats
 
-- **Copying by iteration.** Inserting the items of one table into another empty table one by one, in iteration order, can be several times slower than inserting in random order (measured 7x at 100k keys), because linear probing builds long runs. `collect()`, `extend()` and `reserve(src.len())` size the target first and do not hit this
 - **Hash quality.** The default hasher is fast, not DoS-resistant. Use `RandomState` for untrusted keys
 
 ## Requirements

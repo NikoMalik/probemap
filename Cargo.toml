@@ -1,6 +1,6 @@
 [package]
 name = "probemap"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "A flat hash map based on Google's SwissTable design (used in Abseil C++)"                                                                                
 license = "Apache-2.0"                                                                                                                                                  
@@ -10,7 +10,7 @@ repository = "https://github.com/NikoMalik/probemap"
 
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(probemap_generic)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(probemap_generic)", "cfg(probemap_linear)"] }
 missing_docs = "warn"
 unreachable_pub = "warn"
 unsafe_op_in_unsafe_fn = "warn"
@@ -75,4 +75,8 @@ opt-level=3
 
 [[bench]]
 name = "bench"
+harness = false
+
+[[bench]]
+name = "probing"
 harness = false

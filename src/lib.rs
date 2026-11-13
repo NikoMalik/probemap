@@ -7,7 +7,7 @@
 //! 1. **Flat storage** — contiguous array, cache-friendly.
 //! 2. **Control bytes** — 1-byte metadata per slot (7-bit h2 hash or marker).
 //! 3. **SIMD probing** — 16 control bytes checked in one SSE2 instruction.
-//! 4. **Linear group probing** — step by GROUP_WIDTH (16) on collision.
+//! 4. **Triangular group probing** — the step grows by one group on every collision.
 //!
 
 /// Allocator API shim — see `alloc.rs`.
@@ -132,8 +132,21 @@ fn read_u32(bytes: &[u8], at: usize) -> u64 {
     ))
 }
 
-#[inline]
+#[inline(always)]
 fn fx_write(hash: u64, bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    if likely(len.wrapping_sub(8) <= 8) {
+        let tag = (len as u64).rotate_right(8);
+        return fx_step(
+            fx_step(hash, read_u64(bytes, 0) ^ tag),
+            read_u64(bytes, len - 8),
+        );
+    }
+    fx_write_other(hash, bytes)
+}
+
+#[inline(never)]
+fn fx_write_other(hash: u64, bytes: &[u8]) -> u64 {
     let len = bytes.len();
     let tag = (len as u64).rotate_right(8);
     match len {
@@ -147,10 +160,6 @@ fn fx_write(hash: u64, bytes: &[u8]) -> u64 {
         4..=7 => fx_step(
             hash,
             (read_u32(bytes, 0) | (read_u32(bytes, len - 4) << 32)) ^ tag,
-        ),
-        8..=16 => fx_step(
-            fx_step(hash, read_u64(bytes, 0) ^ tag),
-            read_u64(bytes, len - 8),
         ),
         _ => {
             let mut h = fx_step(hash, tag);
@@ -483,6 +492,16 @@ const KEEP_OLD: u8 = 2;
 
 const MIN_BUCKETS: usize = 8;
 
+#[inline(always)]
+fn next_probe(pos: usize, step: &mut usize, mask: usize) -> usize {
+    if cfg!(probemap_linear) {
+        (pos + GROUP_WIDTH) & mask
+    } else {
+        *step += GROUP_WIDTH;
+        (pos + *step) & mask
+    }
+}
+
 #[inline(never)]
 unsafe fn replace_and_drop<T>(slot: *mut T, value: T) {
     // SAFETY: slot holds a live T (caller invariant), the old value is moved out before it drops.
@@ -793,8 +812,8 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
     /// Next group in probe chain: `(pos + GROUP_WIDTH) & mask`.
     #[inline(always)]
-    fn next_group(&self, pos: usize) -> usize {
-        (pos + GROUP_WIDTH) & self.mask
+    fn next_group(&self, pos: usize, step: &mut usize) -> usize {
+        next_probe(pos, step, self.mask)
     }
 
     // =========================================================================
@@ -856,6 +875,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let hash = self.make_hash(E::extract(&value));
         let h2 = ctrl::h2(hash);
         let mut pos = self.probe_start(hash);
+        let mut step = 0;
         let ctrl = self.ctrl_ptr();
         let mask = self.mask;
 
@@ -877,7 +897,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 // SAFETY: slot initialized
                 return unsafe { &mut *self.slot_mut(idx).cast::<E::Value>() };
             }
-            pos = self.next_group(pos);
+            pos = self.next_group(pos, &mut step);
         }
     }
 
@@ -892,6 +912,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
+        let mut step = 0;
         let mut insert_slot: usize = usize::MAX; // sentinel: no candidate yet
 
         loop {
@@ -970,7 +991,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 }
             }
 
-            pos = self.next_group(pos);
+            pos = self.next_group(pos, &mut step);
         }
     }
 
@@ -994,6 +1015,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
+        let mut step = 0;
         let ctrl = self.ctrl_ptr();
         // SAFETY: hint only with no memory touches
         unsafe {
@@ -1023,7 +1045,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             if likely(group.match_empty().any()) {
                 return None;
             }
-            pos = self.next_group(pos);
+            pos = self.next_group(pos, &mut step);
         }
     }
 
@@ -1254,6 +1276,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
+        let mut step = 0;
         let mut insert_slot: usize = usize::MAX;
         let ctrl = self.ctrl_ptr();
         // SAFETY: hint only with no memory touches
@@ -1316,7 +1339,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                 }
             }
 
-            pos = self.next_group(pos);
+            pos = self.next_group(pos, &mut step);
         }
     }
 
@@ -1429,7 +1452,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         unsafe {
             prefetch_read(self.ctrl_ptr().add(pos));
             prefetch_read(self.slots_ptr().add(pos).cast());
-            let next_pos = self.next_group(pos);
+            let next_pos = self.next_group(pos, &mut 0);
             prefetch_read_l2(self.ctrl_ptr().add(next_pos));
         }
     }
@@ -1491,6 +1514,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
             while let Some((_, src)) = raw.next() {
                 let hash = self.hash_builder.hash_one(E::extract(&*src));
                 let mut pos = (hash as usize) & new_mask;
+                let mut step = 0;
                 let idx = loop {
                     let empty = Group::load(ncp.add(pos)).match_empty_or_deleted();
                     if likely(empty.any()) {
@@ -1500,7 +1524,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                             (pos + empty.lowest_set_bit()) & new_mask,
                         );
                     }
-                    pos = (pos + GROUP_WIDTH) & new_mask;
+                    pos = next_probe(pos, &mut step, new_mask);
                 };
                 set_ctrl(ncp, new_mask, idx, ctrl::h2(hash));
                 ptr::copy_nonoverlapping(src.cast::<u8>(), nsp.add(idx * size), size);
@@ -1521,6 +1545,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     fn find_insert_slot(&self, hash: u64) -> usize {
         let ctrl = self.ctrl_ptr();
         let mut pos = self.probe_start(hash);
+        let mut step = 0;
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes.
             let m = unsafe { Group::load(ctrl.add(pos)) }.match_empty_or_deleted();
@@ -1530,7 +1555,7 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                     fix_insert_slot(ctrl, self.mask, (pos + m.lowest_set_bit()) & self.mask)
                 };
             }
-            pos = self.next_group(pos);
+            pos = self.next_group(pos, &mut step);
         }
     }
 
@@ -2796,5 +2821,28 @@ mod tests {
             zeros.len(),
             "zero keys of different length collide"
         );
+    }
+
+    #[test]
+    fn test_probe_sequence_visits_every_group() {
+        for mask in [GROUP_WIDTH - 1, 255, 1023, (1 << 16) - 1] {
+            let groups = (mask + 1) / GROUP_WIDTH;
+            let mut seen = std::collections::HashSet::new();
+            let (mut pos, mut step) = (5 & mask, 0);
+            for _ in 0..groups {
+                seen.insert(pos);
+                pos = next_probe(pos, &mut step, mask);
+            }
+            assert_eq!(seen.len(), groups, "mask {mask}");
+        }
+        let mut step = 0;
+        let first = next_probe(0, &mut step, 1023);
+        let second = next_probe(first, &mut step, 1023);
+        let want = if cfg!(probemap_linear) {
+            2 * GROUP_WIDTH
+        } else {
+            3 * GROUP_WIDTH
+        };
+        assert_eq!((first, second), (GROUP_WIDTH, want));
     }
 }

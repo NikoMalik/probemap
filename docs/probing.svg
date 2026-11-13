@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="522" viewBox="0 0 760 522" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<style>
+.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e4e3df}.ref{stroke:#52514e}.s1{fill:#2a78d6}.s2{fill:#eb6834}.s3{fill:#1baf7a}.s4{fill:#8a63d2}.good{fill:#1f7a3a}.bad{fill:#b3261e}
+@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#3a3936}.ref{stroke:#c3c2b7}.s1{fill:#3987e5}.s2{fill:#d95926}.s3{fill:#199e70}.s4{fill:#a07ee8}.good{fill:#5cc27a}.bad{fill:#f07a72}}
+</style>
+<rect width="100%" height="100%" rx="8" class="bg"/>
+<text x="16" y="28" font-size="16" font-weight="600" class="t1">Linear vs triangular probing, 14000 keys, 85% full</text>
+<text x="16" y="47" font-size="12" class="t2">N/start: N keys share a start position. Time relative to hashbrown (1.0), shorter is faster</text>
+<rect x="16" y="56" width="10" height="10" rx="2" class="s1"/><text x="31" y="65" font-size="12" class="t2">probemap triangular</text>
+<rect x="176.4" y="56" width="10" height="10" rx="2" class="s4"/><text x="191.4" y="65" font-size="12" class="t2">probemap linear</text>
+<rect x="310.4" y="56" width="10" height="10" rx="2" class="s2"/><text x="325.4" y="65" font-size="12" class="t2">hashbrown</text>
+<line x1="150.0" y1="70" x2="150.0" y2="482" class="grid" stroke-width="1"/>
+<text x="150.0" y="498" font-size="11" text-anchor="middle" class="t2">0</text>
+<line x1="202.4" y1="70" x2="202.4" y2="482" class="grid" stroke-width="1"/>
+<text x="202.4" y="498" font-size="11" text-anchor="middle" class="t2">0.5</text>
+<line x1="254.7" y1="70" x2="254.7" y2="482" class="ref" stroke-dasharray="3 3" stroke-width="1"/>
+<text x="254.7" y="498" font-size="11" text-anchor="middle" class="t2">1</text>
+<line x1="307.1" y1="70" x2="307.1" y2="482" class="grid" stroke-width="1"/>
+<text x="307.1" y="498" font-size="11" text-anchor="middle" class="t2">1.5</text>
+<line x1="359.4" y1="70" x2="359.4" y2="482" class="grid" stroke-width="1"/>
+<text x="359.4" y="498" font-size="11" text-anchor="middle" class="t2">2</text>
+<line x1="411.8" y1="70" x2="411.8" y2="482" class="grid" stroke-width="1"/>
+<text x="411.8" y="498" font-size="11" text-anchor="middle" class="t2">2.5</text>
+<line x1="464.1" y1="70" x2="464.1" y2="482" class="grid" stroke-width="1"/>
+<text x="464.1" y="498" font-size="11" text-anchor="middle" class="t2">3</text>
+<line x1="516.5" y1="70" x2="516.5" y2="482" class="grid" stroke-width="1"/>
+<text x="516.5" y="498" font-size="11" text-anchor="middle" class="t2">3.5</text>
+<line x1="568.8" y1="70" x2="568.8" y2="482" class="grid" stroke-width="1"/>
+<text x="568.8" y="498" font-size="11" text-anchor="middle" class="t2">4</text>
+<line x1="621.2" y1="70" x2="621.2" y2="482" class="grid" stroke-width="1"/>
+<text x="621.2" y="498" font-size="11" text-anchor="middle" class="t2">4.5</text>
+<text x="700" y="64" font-size="11" text-anchor="middle" class="t2">linear vs tri</text>
+<text x="140" y="89" font-size="12" text-anchor="end" class="t1">1/start insert</text>
+<rect x="150" y="77" width="89.6" height="7" rx="2" class="s1"><title>probemap triangular: 121.2 µs (0.86x)</title></rect>
+<rect x="150" y="86" width="89.4" height="7" rx="2" class="s4"><title>probemap linear: 120.9 µs (0.85x)</title></rect>
+<rect x="150" y="95" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 141.6 µs (1.00x)</title></rect>
+<text x="700" y="89" font-size="12" font-weight="600" text-anchor="middle" class="t2">0%</text>
+<text x="140" y="123" font-size="12" text-anchor="end" class="t1">1/start hit</text>
+<rect x="150" y="111" width="76.8" height="7" rx="2" class="s1"><title>probemap triangular: 90.2 µs (0.73x)</title></rect>
+<rect x="150" y="120" width="79.3" height="7" rx="2" class="s4"><title>probemap linear: 93.1 µs (0.76x)</title></rect>
+<rect x="150" y="129" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 123.0 µs (1.00x)</title></rect>
+<text x="700" y="123" font-size="12" font-weight="600" text-anchor="middle" class="bad">+3%</text>
+<text x="140" y="157" font-size="12" text-anchor="end" class="t1">1/start miss</text>
+<rect x="150" y="145" width="90.7" height="7" rx="2" class="s1"><title>probemap triangular: 302.4 µs (0.87x)</title></rect>
+<rect x="150" y="154" width="102.0" height="7" rx="2" class="s4"><title>probemap linear: 340.2 µs (0.97x)</title></rect>
+<rect x="150" y="163" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 349.2 µs (1.00x)</title></rect>
+<text x="700" y="157" font-size="12" font-weight="600" text-anchor="middle" class="bad">+13%</text>
+<text x="140" y="191" font-size="12" text-anchor="end" class="t1">8/start insert</text>
+<rect x="150" y="179" width="109.7" height="7" rx="2" class="s1"><title>probemap triangular: 256.0 µs (1.05x)</title></rect>
+<rect x="150" y="188" width="120.5" height="7" rx="2" class="s4"><title>probemap linear: 281.3 µs (1.15x)</title></rect>
+<rect x="150" y="197" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 244.4 µs (1.00x)</title></rect>
+<text x="700" y="191" font-size="12" font-weight="600" text-anchor="middle" class="bad">+10%</text>
+<text x="140" y="225" font-size="12" text-anchor="end" class="t1">8/start hit</text>
+<rect x="150" y="213" width="85.7" height="7" rx="2" class="s1"><title>probemap triangular: 175.6 µs (0.82x)</title></rect>
+<rect x="150" y="222" width="130.4" height="7" rx="2" class="s4"><title>probemap linear: 267.4 µs (1.25x)</title></rect>
+<rect x="150" y="231" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 214.6 µs (1.00x)</title></rect>
+<text x="700" y="225" font-size="12" font-weight="600" text-anchor="middle" class="bad">+52%</text>
+<text x="140" y="259" font-size="12" text-anchor="end" class="t1">8/start miss</text>
+<rect x="150" y="247" width="104.4" height="7" rx="2" class="s1"><title>probemap triangular: 531.7 µs (1.00x)</title></rect>
+<rect x="150" y="256" width="147.8" height="7" rx="2" class="s4"><title>probemap linear: 752.9 µs (1.41x)</title></rect>
+<rect x="150" y="265" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 533.2 µs (1.00x)</title></rect>
+<text x="700" y="259" font-size="12" font-weight="600" text-anchor="middle" class="bad">+42%</text>
+<text x="140" y="293" font-size="12" text-anchor="end" class="t1">32/start insert</text>
+<rect x="150" y="281" width="115.4" height="7" rx="2" class="s1"><title>probemap triangular: 421.7 µs (1.10x)</title></rect>
+<rect x="150" y="290" width="187.0" height="7" rx="2" class="s4"><title>probemap linear: 683.3 µs (1.79x)</title></rect>
+<rect x="150" y="299" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 382.6 µs (1.00x)</title></rect>
+<text x="700" y="293" font-size="12" font-weight="600" text-anchor="middle" class="bad">+62%</text>
+<text x="140" y="327" font-size="12" text-anchor="end" class="t1">32/start hit</text>
+<rect x="150" y="315" width="95.6" height="7" rx="2" class="s1"><title>probemap triangular: 373.2 µs (0.91x)</title></rect>
+<rect x="150" y="324" width="169.7" height="7" rx="2" class="s4"><title>probemap linear: 662.7 µs (1.62x)</title></rect>
+<rect x="150" y="333" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 409.0 µs (1.00x)</title></rect>
+<text x="700" y="327" font-size="12" font-weight="600" text-anchor="middle" class="bad">+78%</text>
+<text x="140" y="361" font-size="12" text-anchor="end" class="t1">32/start miss</text>
+<rect x="150" y="349" width="107.2" height="7" rx="2" class="s1"><title>probemap triangular: 780.8 µs (1.02x)</title></rect>
+<rect x="150" y="358" width="458.5" height="7" rx="2" class="s4"><title>probemap linear: 3337.9 µs (4.38x)</title></rect>
+<rect x="150" y="367" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 762.4 µs (1.00x)</title></rect>
+<text x="700" y="361" font-size="12" font-weight="600" text-anchor="middle" class="bad">+327%</text>
+<text x="140" y="395" font-size="12" text-anchor="end" class="t1">128/start insert</text>
+<rect x="150" y="383" width="124.1" height="7" rx="2" class="s1"><title>probemap triangular: 725.5 µs (1.18x)</title></rect>
+<rect x="150" y="392" width="200.6" height="7" rx="2" class="s4"><title>probemap linear: 1173.1 µs (1.92x)</title></rect>
+<rect x="150" y="401" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 612.3 µs (1.00x)</title></rect>
+<text x="700" y="395" font-size="12" font-weight="600" text-anchor="middle" class="bad">+62%</text>
+<text x="140" y="429" font-size="12" text-anchor="end" class="t1">128/start hit</text>
+<rect x="150" y="417" width="98.0" height="7" rx="2" class="s1"><title>probemap triangular: 670.1 µs (0.94x)</title></rect>
+<rect x="150" y="426" width="164.0" height="7" rx="2" class="s4"><title>probemap linear: 1121.8 µs (1.57x)</title></rect>
+<rect x="150" y="435" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 716.3 µs (1.00x)</title></rect>
+<text x="700" y="429" font-size="12" font-weight="600" text-anchor="middle" class="bad">+67%</text>
+<text x="140" y="463" font-size="12" text-anchor="end" class="t1">128/start miss</text>
+<rect x="150" y="451" width="100.7" height="7" rx="2" class="s1"><title>probemap triangular: 1218.5 µs (0.96x)</title></rect>
+<rect x="150" y="460" width="328.1" height="7" rx="2" class="s4"><title>probemap linear: 3970.0 µs (3.13x)</title></rect>
+<rect x="150" y="469" width="104.7" height="7" rx="2" class="s2"><title>hashbrown: 1267.0 µs (1.00x)</title></rect>
+<text x="700" y="463" font-size="12" font-weight="600" text-anchor="middle" class="bad">+226%</text>
+</svg>

@@ -433,7 +433,7 @@ fn bench_clone(c: &mut Criterion) {
 
 // ---------------------------------------------------------------------------
 // Byte-key benchmarks — exercises Hasher::write(bytes) path
-// probemap: AutoHasher -> fx_bytes, rotate-xor-multiply per 8-byte chunk
+// probemap: AutoHasher -> fx_write, two 8-byte loads for keys of 8 to 16 bytes
 // probemap_fx and hb_fxhash: the same FxBuildHasher, so only the tables differ
 // hb_foldhash: foldhash default
 // insert_bytes reuses one warm table, clears it and clones the keys outside the timing,
