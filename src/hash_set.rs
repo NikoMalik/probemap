@@ -96,9 +96,7 @@ impl<T: Hash + Eq, S: BuildHasher, A: Allocator> HashSet<T, S, A> {
 
     #[inline]
     pub fn insert(&mut self, value: T) -> bool {
-        let before = self.table.len();
-        self.table.get_or_insert(value);
-        self.table.len() != before
+        self.table.insert_if_absent(value).is_none()
     }
 
     #[inline]

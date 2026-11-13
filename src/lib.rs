@@ -477,6 +477,10 @@ fn capacity_to_buckets(items: usize) -> Option<usize> {
     (items.checked_mul(8)? / 7).checked_next_power_of_two()
 }
 
+const OVERWRITE: u8 = 0;
+const RETURN_OLD: u8 = 1;
+const KEEP_OLD: u8 = 2;
+
 const MIN_BUCKETS: usize = 8;
 
 #[inline(never)]
@@ -826,17 +830,22 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     pub fn insert(&mut self, value: E::Value) {
         if unlikely(self.mask == 0) {
             self.ensure_capacity();
-            self.insert_inner::<false>(value);
-            return;
         }
-        self.insert_inner::<false>(value);
+        self.insert_inner::<OVERWRITE>(value);
     }
 
     pub fn replace(&mut self, value: E::Value) -> Option<E::Value> {
         if unlikely(self.mask == 0) {
             self.ensure_capacity();
         }
-        self.insert_inner::<true>(value)
+        self.insert_inner::<RETURN_OLD>(value)
+    }
+
+    pub(crate) fn insert_if_absent(&mut self, value: E::Value) -> Option<E::Value> {
+        if unlikely(self.mask == 0) {
+            self.ensure_capacity();
+        }
+        self.insert_inner::<KEEP_OLD>(value)
     }
 
     /// Fast insert for rehash — no duplicate check, no deleted slots.
@@ -874,21 +883,16 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
 
     // /// Inner insert with duplicate check.
     #[inline]
-    fn insert_inner<const RETURN_OLD: bool>(&mut self, value: E::Value) -> Option<E::Value> {
+    fn insert_inner<const MODE: u8>(&mut self, value: E::Value) -> Option<E::Value> {
+        let ctrl = self.ctrl_ptr();
+        // SAFETY: prefetch is only a hint, ctrl points to the live table.
+        unsafe { prefetch_nta(ctrl) };
         let key = E::extract(&value);
         let hash = self.make_hash(key);
         let h2 = ctrl::h2(hash);
         let cap_mask = self.mask;
         let mut pos = self.probe_start(hash);
         let mut insert_slot: usize = usize::MAX; // sentinel: no candidate yet
-        let ctrl = self.ctrl_ptr();
-        // // SAFETY: hint only with no memory touches
-        unsafe {
-            // Prefetch the heap-allocated memory region to resolve potential TLB and
-            // cache misses. This is intended to overlap with execution of calculating the
-            // hash for a key.
-            prefetch_nta(ctrl);
-        }
 
         loop {
             // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
@@ -907,8 +911,11 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
                     // SAFETY: idx is a valid FULL slot, the new value is put in before the old
                     // one is dropped, so a panicking Drop leaves the table consistent.
                     unsafe {
-                        if RETURN_OLD {
+                        if MODE == RETURN_OLD {
                             return Some(ptr::replace(val_ptr, value));
+                        }
+                        if MODE == KEEP_OLD {
+                            return Some(value);
                         }
                         if core::mem::needs_drop::<E::Value>() {
                             replace_and_drop(val_ptr, value);
@@ -1237,7 +1244,6 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     pub fn get_or_insert(&mut self, value: E::Value) -> &mut E::Value {
         if unlikely(self.mask == 0) {
             self.ensure_capacity();
-            return self.get_or_insert_inner(value);
         }
         self.get_or_insert_inner(value)
     }
