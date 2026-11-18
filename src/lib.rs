@@ -116,11 +116,6 @@ impl FxHasher {
 }
 
 #[inline(always)]
-fn fx_step(hash: u64, word: u64) -> u64 {
-    (hash.rotate_left(5) ^ word).wrapping_mul(SEED)
-}
-
-#[inline(always)]
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
 }
@@ -132,15 +127,26 @@ fn read_u32(bytes: &[u8], at: usize) -> u64 {
     ))
 }
 
+const MIX_A: u64 = 0x2d35_8dcc_aa6c_78a5;
+const MIX_B: u64 = 0x8bb8_4b93_962e_acc9;
+
+#[inline(always)]
+fn fold_mul(a: u64, b: u64) -> u64 {
+    let p = u128::from(a) * u128::from(b);
+    (p as u64) ^ ((p >> 64) as u64)
+}
+
+#[inline(always)]
+fn fold_pair(seed: u64, a: u64, b: u64) -> u64 {
+    fold_mul(a ^ MIX_A, b ^ seed ^ MIX_B)
+}
+
 #[inline(always)]
 fn fx_write(hash: u64, bytes: &[u8]) -> u64 {
     let len = bytes.len();
     if likely(len.wrapping_sub(8) <= 8) {
-        let tag = (len as u64).rotate_right(8);
-        return fx_step(
-            fx_step(hash, read_u64(bytes, 0) ^ tag),
-            read_u64(bytes, len - 8),
-        );
+        let seed = (hash ^ (len as u64)).wrapping_mul(MIX_A);
+        return fold_pair(seed, read_u64(bytes, 0), read_u64(bytes, len - 8));
     }
     fx_write_other(hash, bytes)
 }
@@ -148,27 +154,24 @@ fn fx_write(hash: u64, bytes: &[u8]) -> u64 {
 #[inline(never)]
 fn fx_write_other(hash: u64, bytes: &[u8]) -> u64 {
     let len = bytes.len();
-    let tag = (len as u64).rotate_right(8);
+    let seed = (hash ^ (len as u64)).wrapping_mul(MIX_A);
     match len {
-        0 => hash,
+        0 => fold_pair(seed, 0, 0),
         1..=3 => {
             let word = u64::from(bytes[0])
                 | (u64::from(bytes[len / 2]) << 8)
                 | (u64::from(bytes[len - 1]) << 16);
-            fx_step(hash, word ^ tag)
+            fold_pair(seed, word, 0)
         }
-        4..=7 => fx_step(
-            hash,
-            (read_u32(bytes, 0) | (read_u32(bytes, len - 4) << 32)) ^ tag,
-        ),
+        4..=7 => fold_pair(seed, read_u32(bytes, 0), read_u32(bytes, len - 4)),
         _ => {
-            let mut h = fx_step(hash, tag);
+            let mut h = seed;
             let mut at = 0;
-            while at + 8 < len {
-                h = fx_step(h, read_u64(bytes, at));
-                at += 8;
+            while at + 16 < len {
+                h = fold_mul(read_u64(bytes, at) ^ MIX_A, read_u64(bytes, at + 8) ^ h);
+                at += 16;
             }
-            fx_step(h, read_u64(bytes, len - 8))
+            fold_pair(h, read_u64(bytes, len - 16), read_u64(bytes, len - 8))
         }
     }
 }
@@ -225,7 +228,7 @@ impl std::hash::BuildHasher for FxBuildHasher {
 }
 
 /// Hybrid hasher: FxHash (rotate-xor-multiply) for integer writes,
-/// buthash `low_level_hash` for byte slices
+/// folded 128-bit multiply for byte slices
 #[repr(transparent)]
 pub struct AutoHasher {
     hash: u64,
@@ -256,8 +259,6 @@ impl std::hash::Hasher for AutoHasher {
     fn finish(&self) -> u64 {
         self.hash.rotate_left(26)
     }
-    // Bytes uses also fxhash
-    /// TODO: find good replace for bytes handle
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         self.fx_bytes(bytes);
@@ -316,7 +317,7 @@ impl std::hash::Hasher for AutoHasher {
 }
 
 /// Default `BuildHasher` for probemap.
-/// Creates `AutoHasher` — FxHash for ints, buthash for bytes.
+/// Creates `AutoHasher` — FxHash for ints, folded multiply for bytes.
 #[derive(Clone, Default)]
 pub struct AutoBuildHasher;
 
@@ -2821,6 +2822,32 @@ mod tests {
             zeros.len(),
             "zero keys of different length collide"
         );
+    }
+
+    #[test]
+    fn test_sequential_keys_spread_over_slots_and_tags() {
+        let bits = 14;
+        let n = 1usize << bits;
+        for prefix in ["memtier-", "user:", "k", "session:000000"] {
+            let mut slots = vec![false; n];
+            let mut tags = [0usize; 128];
+            for i in 0..n {
+                let key = format!("{prefix}{i}");
+                let h = AutoBuildHasher.hash_one(key.as_bytes());
+                slots[(h as usize) & (n - 1)] = true;
+                tags[(h >> 57) as usize] += 1;
+            }
+            let used = slots.iter().filter(|&&b| b).count();
+            assert!(
+                used * 100 >= n * 60,
+                "{prefix}: only {used} of {n} slots used"
+            );
+            let (min, max) = (tags.iter().min().unwrap(), tags.iter().max().unwrap());
+            assert!(
+                *max <= 2 * *min,
+                "{prefix}: tags uneven, min {min} max {max}"
+            );
+        }
     }
 
     #[test]
