@@ -168,6 +168,13 @@ impl<T: Hash + Eq, S: BuildHasher, A: Allocator> HashSet<T, S, A> {
         self.table.iter()
     }
 
+    /// One step of a cursor scan over the values, see [`SwissTable::scan`].
+    ///
+    /// [`SwissTable::scan`]: crate::SwissTable::scan
+    pub fn scan(&self, cursor: u64, budget: usize, f: impl FnMut(&T)) -> u64 {
+        self.table.scan(cursor, budget, f)
+    }
+
     pub fn difference<'a>(&'a self, other: &'a Self) -> impl FusedIterator<Item = &'a T> {
         self.iter().filter(move |v| !other.contains(*v))
     }

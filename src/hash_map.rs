@@ -170,6 +170,13 @@ impl<K: Hash + Eq, V, S: BuildHasher, A: Allocator> HashMap<K, V, S, A> {
         Iter(self.table.iter())
     }
 
+    /// One step of a cursor scan over the entries, see [`SwissTable::scan`].
+    ///
+    /// [`SwissTable::scan`]: crate::SwissTable::scan
+    pub fn scan(&self, cursor: u64, budget: usize, mut f: impl FnMut(&K, &V)) -> u64 {
+        self.table.scan(cursor, budget, |(k, v)| f(k, v))
+    }
+
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V, S, A> {
         IterMut(self.table.iter_mut())
     }
@@ -629,5 +636,66 @@ mod tests {
             .collect();
         let total: usize = handles.into_iter().map(|h| h.join().expect("thread")).sum();
         assert_eq!(total, 400 + 6);
+    }
+
+    fn scan_all(map: &HashMap<u64, u64>, cursor: u64, budget: usize, seen: &mut Vec<u64>) -> u64 {
+        map.scan(cursor, budget, |k, _| seen.push(*k))
+    }
+
+    #[test]
+    fn scan_visits_every_entry_once_when_nothing_changes() {
+        for n in [0u64, 1, 7, 8, 15, 16, 100, 5_000] {
+            for budget in [1usize, 3, 64, 1 << 20] {
+                let map: HashMap<u64, u64> = (0..n).map(|k| (k, k)).collect();
+                let mut seen = Vec::new();
+                let mut cursor = scan_all(&map, 0, budget, &mut seen);
+                while cursor != 0 {
+                    cursor = scan_all(&map, cursor, budget, &mut seen);
+                }
+                seen.sort_unstable();
+                assert_eq!(seen, (0..n).collect::<Vec<_>>(), "n {n} budget {budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_keeps_every_old_entry_while_the_table_grows_and_shrinks() {
+        for budget in [1usize, 5, 40] {
+            let mut map: HashMap<u64, u64> = (0..300u64).map(|k| (k, k)).collect();
+            let mut seen = Vec::new();
+            let mut cursor = scan_all(&map, 0, budget, &mut seen);
+            let mut round = 0u64;
+            while cursor != 0 {
+                round += 1;
+                if round % 3 == 0 {
+                    for k in 0..200 {
+                        map.insert(1_000_000 + round * 1_000 + k, 0);
+                    }
+                }
+                if round % 7 == 0 {
+                    map.retain(|k, _| *k < 1_000_000);
+                    map.shrink_to_fit();
+                }
+                cursor = scan_all(&map, cursor, budget, &mut seen);
+            }
+            for k in 0..300u64 {
+                assert!(seen.contains(&k), "key {k} lost with budget {budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_skips_removed_entries_and_sees_the_rest() {
+        let mut map: HashMap<u64, u64> = (0..1_000u64).map(|k| (k, k)).collect();
+        for k in (0..1_000u64).step_by(2) {
+            map.remove(&k);
+        }
+        let mut seen = Vec::new();
+        let mut cursor = scan_all(&map, 0, 7, &mut seen);
+        while cursor != 0 {
+            cursor = scan_all(&map, cursor, 7, &mut seen);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (1..1_000u64).step_by(2).collect::<Vec<_>>());
     }
 }

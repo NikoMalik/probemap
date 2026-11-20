@@ -1441,6 +1441,55 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         }
     }
 
+    /// One step of a cursor scan, in the order of Redis `SCAN`.
+    ///
+    /// Visits the values whose home bucket (`hash & mask`) is one of the next `budget`
+    /// buckets in reverse-binary order starting at `cursor` (`0` starts a scan), and
+    /// returns the cursor for the next call, `0` once every bucket was visited.
+    ///
+    /// A value present for the whole scan is visited at least once even when the table
+    /// grows or shrinks between calls. After a resize a value may be visited again.
+    /// Values inserted or removed during the scan may or may not be visited.
+    pub fn scan(&self, cursor: u64, budget: usize, mut f: impl FnMut(&E::Value)) -> u64 {
+        if self.mask == 0 {
+            return 0;
+        }
+        let mask = self.mask as u64;
+        let ctrl = self.ctrl_ptr();
+        let mut v = cursor;
+        for _ in 0..budget.max(1) {
+            let home = (v & mask) as usize;
+            let mut pos = home;
+            let mut step = 0;
+            loop {
+                // SAFETY: pos < cap, ctrl has cap + GROUP_WIDTH bytes, so pos..pos+GROUP_WIDTH is within allocation.
+                let group = unsafe { Group::load(ctrl.add(pos)) };
+                let mut full = group.match_full();
+                while full.any() {
+                    let idx = (pos + full.lowest_set_bit()) & self.mask;
+                    // SAFETY: idx < cap (masked) and the slot is FULL, so it holds an initialized value.
+                    let value = unsafe { &*self.slot_mut(idx).cast::<E::Value>() };
+                    if self.probe_start(self.hash_builder.hash_one(E::extract(value))) == home {
+                        f(value);
+                    }
+                    full.remove_lowest_bit();
+                }
+                // Every value with this home sits before the first group with an EMPTY
+                // slot, the same place where `find` stops.
+                if group.match_empty().any() {
+                    break;
+                }
+                pos = self.next_group(pos, &mut step);
+            }
+            v |= !mask;
+            v = v.reverse_bits().wrapping_add(1).reverse_bits();
+            if v == 0 {
+                return 0;
+            }
+        }
+        v
+    }
+
     /// Prefetch ctrl + slots for a key into CPU cache.
     #[cfg(target_arch = "x86_64")]
     pub fn prefetch(&self, key: &E::Key) {
