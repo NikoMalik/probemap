@@ -126,6 +126,14 @@ impl<T: Hash + Eq, S: BuildHasher, A: Allocator> HashSet<T, S, A> {
     }
 
     #[inline]
+    pub fn prefetch<Q>(&self, value: &Q)
+    where
+        Q: Hash + ?Sized,
+    {
+        self.table.prefetch(value);
+    }
+
+    #[inline]
     pub fn get<Q>(&self, value: &Q) -> Option<&T>
     where
         Q: Hash + Equivalent<T> + ?Sized,
@@ -304,6 +312,17 @@ impl<T: Hash + Eq + fmt::Debug, S: BuildHasher, A: Allocator> fmt::Debug for Has
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefetch_is_safe_on_any_value() {
+        let mut s: HashSet<u64> = HashSet::new();
+        s.prefetch(&7);
+        s.extend(0..100);
+        s.prefetch(&7);
+        s.prefetch(&1_000_000);
+        assert_eq!(s.len(), 100);
+        assert!(s.contains(&7));
+    }
 
     #[test]
     fn behaves_like_std() {

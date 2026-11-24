@@ -104,6 +104,14 @@ impl<K: Hash + Eq, V, S: BuildHasher, A: Allocator> HashMap<K, V, S, A> {
     }
 
     #[inline]
+    pub fn prefetch<Q>(&self, k: &Q)
+    where
+        Q: Hash + ?Sized,
+    {
+        self.table.prefetch(k);
+    }
+
+    #[inline]
     pub fn get<Q>(&self, k: &Q) -> Option<&V>
     where
         Q: Hash + Equivalent<K> + ?Sized,
@@ -535,6 +543,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefetch_is_safe_on_any_key_and_changes_nothing() {
+        let mut m: HashMap<String, u32> = HashMap::new();
+        m.prefetch("absent");
+        for i in 0..1000u32 {
+            m.insert(i.to_string(), i);
+        }
+        for i in 0..2000u32 {
+            m.prefetch(i.to_string().as_str());
+        }
+        assert_eq!(m.len(), 1000);
+        assert_eq!(m.get("999"), Some(&999));
+        assert_eq!(m.get("1000"), None);
+    }
 
     #[test]
     fn behaves_like_std() {

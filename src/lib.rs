@@ -445,8 +445,44 @@ unsafe fn prefetch_read_l2(ptr: *const u8) {
     unsafe { _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_T2) };
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// Prefetch data into L1 cache.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn prefetch_read(ptr: *const u8) {
+    // SAFETY: prfm is a hint only with no memory safety requirements; ptr may be invalid.
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nostack, readonly, preserves_flags));
+    };
+}
+
+/// Prefetch with non-temporal hint – data used once, discard quickly.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn prefetch_nta(ptr: *const u8) {
+    // SAFETY: prfm is a hint only with no memory safety requirements; ptr may be invalid.
+    unsafe {
+        core::arch::asm!("prfm pldl1strm, [{0}]", in(reg) ptr, options(nostack, readonly, preserves_flags));
+    };
+}
+
+/// Prefetch data into L2+ cache.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn prefetch_read_l2(ptr: *const u8) {
+    // SAFETY: prfm is a hint only with no memory safety requirements; ptr may be invalid.
+    unsafe {
+        core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) ptr, options(nostack, readonly, preserves_flags));
+    };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+unsafe fn prefetch_read(_ptr: *const u8) {}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn prefetch_nta(_ptr: *const u8) {}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+unsafe fn prefetch_read_l2(_ptr: *const u8) {}
 
 // =============================================================================
 // SwissTable
@@ -1491,25 +1527,23 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
     }
 
     /// Prefetch ctrl + slots for a key into CPU cache.
-    #[cfg(target_arch = "x86_64")]
-    pub fn prefetch(&self, key: &E::Key) {
+    #[inline]
+    pub fn prefetch<Q>(&self, key: &Q)
+    where
+        Q: std::hash::Hash + ?Sized,
+    {
         if self.mask == 0 {
             return;
         }
-        let hash = self.make_hash(key);
-        let pos = self.probe_start(hash);
+        let pos = self.probe_start(self.hash_builder.hash_one(key));
         // SAFETY: prefetch is a hint; pos derived from hash & mask so within ctrl/slots bounds.
         unsafe {
             prefetch_read(self.ctrl_ptr().add(pos));
-            prefetch_read(self.slots_ptr().add(pos).cast());
+            prefetch_read(self.slot_mut(pos).cast::<u8>());
             let next_pos = self.next_group(pos, &mut 0);
             prefetch_read_l2(self.ctrl_ptr().add(next_pos));
         }
     }
-
-    /// Prefetch (no-op on non-x86_64).
-    #[cfg(not(target_arch = "x86_64"))]
-    pub fn prefetch(&self, _key: &E::Key) {}
 
     #[cold]
     #[inline(never)]
