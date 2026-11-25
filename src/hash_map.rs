@@ -103,6 +103,27 @@ impl<K: Hash + Eq, V, S: BuildHasher, A: Allocator> HashMap<K, V, S, A> {
         self.table.replace((k, v)).map(|(_, v)| v)
     }
 
+    /// Number of buckets, see [`SwissTable::buckets`].
+    ///
+    /// [`SwissTable::buckets`]: crate::SwissTable::buckets
+    pub fn buckets(&self) -> usize {
+        self.table.buckets()
+    }
+
+    /// How many more inserts fit before the table grows, see [`SwissTable::headroom`].
+    ///
+    /// [`SwissTable::headroom`]: crate::SwissTable::headroom
+    pub fn headroom(&self) -> usize {
+        self.table.headroom()
+    }
+
+    /// Takes the value out of one bucket, see [`SwissTable::take_bucket`].
+    ///
+    /// [`SwissTable::take_bucket`]: crate::SwissTable::take_bucket
+    pub fn take_bucket(&mut self, index: usize) -> Option<(K, V)> {
+        self.table.take_bucket(index)
+    }
+
     #[inline]
     pub fn prefetch<Q>(&self, k: &Q)
     where
@@ -720,5 +741,60 @@ mod tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, (1..1_000u64).step_by(2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn headroom_counts_down_to_the_growth() {
+        let mut map: HashMap<u64, u64> = HashMap::with_capacity(100);
+        let buckets = map.buckets();
+        let room = map.headroom();
+        assert!(buckets.is_power_of_two() && room >= 100 && room < buckets);
+        for i in 0..room as u64 {
+            map.insert(i, i);
+        }
+        assert_eq!(map.headroom(), 0);
+        assert_eq!(map.buckets(), buckets, "no growth while there was room");
+        map.insert(u64::MAX, 0);
+        assert!(map.buckets() > buckets, "the next new value grew the table");
+        assert!(
+            HashMap::<u64, u64>::new().headroom() == 0 && HashMap::<u64, u64>::new().buckets() == 0
+        );
+    }
+
+    #[test]
+    fn take_bucket_moves_every_value_into_a_bigger_table_once() {
+        let mut old: HashMap<u64, u64> = HashMap::with_capacity(1000);
+        for i in 0..1000u64 {
+            old.insert(i * 7, i);
+        }
+        for i in (0..1000u64).step_by(3) {
+            old.remove(&(i * 7));
+        }
+        let left = old.len();
+        let mut new: HashMap<u64, u64> = HashMap::with_capacity(left * 2);
+        let new_buckets = new.buckets();
+        for index in 0..old.buckets() {
+            if let Some((k, v)) = old.take_bucket(index) {
+                assert!(new.insert(k, v).is_none(), "{k} moved twice");
+            }
+            assert_eq!(
+                old.take_bucket(index),
+                None,
+                "bucket {index} is empty after a take"
+            );
+        }
+        assert!(old.is_empty());
+        assert_eq!(new.len(), left);
+        assert_eq!(new.buckets(), new_buckets, "the bigger table did not grow");
+        for i in 0..1000u64 {
+            assert_eq!(
+                new.get(&(i * 7)).copied(),
+                (i % 3 != 0).then_some(i),
+                "key {}",
+                i * 7
+            );
+        }
+        assert_eq!(old.take_bucket(old.buckets()), None, "past the end");
+        assert_eq!(HashMap::<u64, u64>::new().take_bucket(0), None);
     }
 }

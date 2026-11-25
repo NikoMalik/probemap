@@ -94,6 +94,27 @@ impl<T: Hash + Eq, S: BuildHasher, A: Allocator> HashSet<T, S, A> {
         self.table.shrink_to_fit();
     }
 
+    /// Number of buckets, see [`SwissTable::buckets`].
+    ///
+    /// [`SwissTable::buckets`]: crate::SwissTable::buckets
+    pub fn buckets(&self) -> usize {
+        self.table.buckets()
+    }
+
+    /// How many more inserts fit before the table grows, see [`SwissTable::headroom`].
+    ///
+    /// [`SwissTable::headroom`]: crate::SwissTable::headroom
+    pub fn headroom(&self) -> usize {
+        self.table.headroom()
+    }
+
+    /// Takes the value out of one bucket, see [`SwissTable::take_bucket`].
+    ///
+    /// [`SwissTable::take_bucket`]: crate::SwissTable::take_bucket
+    pub fn take_bucket(&mut self, index: usize) -> Option<T> {
+        self.table.take_bucket(index)
+    }
+
     #[inline]
     pub fn insert(&mut self, value: T) -> bool {
         self.table.insert_if_absent(value).is_none()

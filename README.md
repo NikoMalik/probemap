@@ -112,6 +112,7 @@ let map = SwissTable::<PairExtract<String, u64>, RandomState>::with_hasher(Rando
 | `clone_table()` / `clone()` | Deep copy |
 | `iter()` / `iter_mut()` / `into_iter()` | Iterators, all `ExactSizeIterator` |
 | `scan(cursor, budget, f)` | Cursor walk like Redis `SCAN`: no state between calls, every value present for the whole walk is seen at least once even if the table resizes (also on `HashMap` / `HashSet`) |
+| `buckets()` / `headroom()` / `take_bucket(i)` | Bucket count, inserts left before the table grows, take the value out of one bucket: for moving values into a bigger table a few at a time instead of one long resize (also on `HashMap` / `HashSet`) |
 | `prefetch(key)` | Hint CPU to preload the control group and the first slot of the key, a no-op on targets other than x86_64 and aarch64 (also on `HashMap` / `HashSet`) |
 | `hasher()` | Reference to the hash builder |
 | `allocator()` | Reference to the allocator |

@@ -1477,6 +1477,43 @@ impl<E: KeyExtract, S: BuildHasher, A: Allocator> SwissTable<E, S, A> {
         }
     }
 
+    /// Number of buckets, a power of two, or `0` before the first allocation.
+    ///
+    /// Bucket indices for [`SwissTable::take_bucket`] are `0..buckets()`.
+    #[inline]
+    pub fn buckets(&self) -> usize {
+        self.capacity()
+    }
+
+    /// How many more values can be inserted before the table grows or rehashes in place.
+    ///
+    /// An insert of a new value at `headroom() == 0` walks every value once to make room.
+    /// A caller that cannot stop for that long can move the values into a bigger table
+    /// itself, a few at a time, with [`SwissTable::take_bucket`].
+    #[inline]
+    pub fn headroom(&self) -> usize {
+        if self.mask == 0 { 0 } else { self.growth_left }
+    }
+
+    /// Takes the value out of bucket `index`, `None` when the bucket holds no value or
+    /// `index` is not below [`SwissTable::buckets`].
+    ///
+    /// The bucket is left as a tombstone, like [`SwissTable::take`] leaves it, so values
+    /// in other buckets keep their places and a walk over `0..buckets()` sees each value
+    /// at most once.
+    #[inline]
+    pub fn take_bucket(&mut self, index: usize) -> Option<E::Value> {
+        if self.mask == 0 || index > self.mask {
+            return None;
+        }
+        // SAFETY: index <= mask < cap, ctrl has cap + GROUP_WIDTH bytes.
+        if !ctrl::is_full(unsafe { *self.ctrl_ptr().add(index) }) {
+            return None;
+        }
+        // SAFETY: the bucket is FULL, take_at marks it DELETED and reads the value once.
+        Some(unsafe { self.take_at(index) })
+    }
+
     /// One step of a cursor scan, in the order of Redis `SCAN`.
     ///
     /// Visits the values whose home bucket (`hash & mask`) is one of the next `budget`
